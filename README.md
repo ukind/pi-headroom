@@ -77,7 +77,7 @@ Upstreams come from `models.json`. This file carries only behavior:
 | key | default | meaning |
 | --- | --- | --- |
 | `port` | `8787` | Headroom proxy port |
-| `shimPort` | `8790` | Path-shim port (loopback only) |
+| `shimPort` | `8790` | Path-shim port (loopback only; scans the next five ports when busy — several pi sessions coexist) |
 | `profile` | `balanced` | Headroom savings profile (read at proxy startup only) |
 | `beacon` | `off` | Headroom telemetry beacon |
 | `telemetry` | `on` | Powers `/stats` |
@@ -110,7 +110,7 @@ Shim-routed providers need Headroom to accept a loopback target: the extension a
 ## Troubleshooting
 
 - **`proxy unavailable after 20000 ms`** — the `headroom` binary is not on PATH (fresh terminal after install), or the port sits in a Windows excluded port range (Headroom issue #589 — set `"port": 8788`).
-- **`path shim unavailable ... (EADDRINUSE)`** — something else holds `8790`; set `"shimPort": 8791`. Shim-routed providers fall back to direct for that session.
+- **`path shim unavailable ... (EADDRINUSE)`** — all of `8790`–`8795` are held (several long-lived pi sessions plus other software). Free one or set `"shimPort": 8796`.
 - **`HTTP_PROXY/HTTPS_PROXY ... NO_PROXY` warning at startup** — add `127.0.0.1,localhost` to `NO_PROXY`; pi's dispatcher has no loopback bypass.
 - **`certificate verify failed` in proxy logs** — TLS interception; do step 3.
 - **Provider turns fail with 401** — Headroom relays your `Authorization` header to the upstream; check the key in `models.json` for that provider.

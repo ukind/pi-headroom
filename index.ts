@@ -186,9 +186,17 @@ export function proxyOrigin(config: HeadroomConfig): string {
   return `http://${PROXY_HOST}:${proxyPort(config)}`;
 }
 
-// Headroom's SSRF guard rejects loopback x-headroom-base-url targets, so any shim-routed
-// provider requires 127.0.0.1:<shimPort> in HEADROOM_ALLOWED_BASE_URLS. Union the user's
-// extraEnv value (if any) with ours; explicit user entries always survive.
+// Candidate ports: the configured shimPort first, then the next five — several pi
+// sessions on one machine each get their own shim without colliding.
+export function shimPortCandidates(config: HeadroomConfig): number[] {
+  const base = shimPort(config);
+  return [base, base + 1, base + 2, base + 3, base + 4, base + 5].filter((p) => p > 0 && p < 65536);
+}
+
+// Headroom's SSRF guard rejects loopback x-headroom-base-url targets, so shim-routed
+// providers need the shim ports in HEADROOM_ALLOWED_BASE_URLS. The allow-list is baked
+// into the spawned proxy's env before we know which port binds, so it covers every
+// candidate. Union with the user's extraEnv value; explicit entries always survive.
 function proxyEnv(config: HeadroomConfig, shimNeeded: boolean): Record<string, string> {
   const env: Record<string, string> = {
     HEADROOM_SAVINGS_PROFILE: config.profile ?? DEFAULT_CONFIG.profile,
@@ -197,10 +205,9 @@ function proxyEnv(config: HeadroomConfig, shimNeeded: boolean): Record<string, s
     ...(config.extraEnv ?? {}),
   };
   if (shimNeeded) {
-    const ours = `${PROXY_HOST}:${shimPort(config)}`;
+    const ours = shimPortCandidates(config).map((p) => `${PROXY_HOST}:${p}`).join(",");
     const theirs = env.HEADROOM_ALLOWED_BASE_URLS;
-    if (!theirs) env.HEADROOM_ALLOWED_BASE_URLS = ours;
-    else if (!theirs.split(",").map((s) => s.trim()).includes(ours)) env.HEADROOM_ALLOWED_BASE_URLS = `${theirs},${ours}`;
+    env.HEADROOM_ALLOWED_BASE_URLS = theirs ? `${theirs},${ours}` : ours;
   }
   return env;
 }
@@ -435,12 +442,13 @@ export function createShimHandler(
 export function startShim(
   config: HeadroomConfig,
   state: HeadroomState,
+  port = shimPort(config),
 ): Server {
   const providers: Record<string, string> = {};
   for (const p of resolveProviders(config).enabled) providers[p.id] = p.upstream;
   const server = createServer(createShimHandler(providers, config));
   state.shim = server;
-  state.shimPort = shimPort(config);
+  state.shimPort = port;
   return server;
 }
 
@@ -463,28 +471,30 @@ export async function ensureShimRunning(
   state: HeadroomState,
 ): Promise<"running" | "started" | "failed"> {
   if (isShimAlive(state)) return "running";
-  const port = shimPort(config);
+  const base = shimPort(config);
   let lastErr = "unknown";
-  // Two attempts: pi can fire shutdown -> session_start back-to-back, and the previous
-  // listener's port may still be mid-release; a short wait makes the rebind stick.
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (attempt > 0) await new Promise((r) => setTimeout(r, 300));
-    const server = startShim(config, state);
-    const bound = await new Promise<boolean>((resolve) => {
-      const onErr = (err: NodeJS.ErrnoException) => {
-        lastErr = err.code ?? err.message;
-        stopShim(state);
-        resolve(false);
-      };
-      server.once("error", onErr);
-      server.listen(port, PROXY_HOST, () => {
-        server.removeListener("error", onErr);
-        resolve(true);
+  // Walk the candidate ports; each gets two listen attempts (pi can fire shutdown ->
+  // session_start back-to-back and the previous listener's port may be mid-release).
+  for (const port of shimPortCandidates(config)) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 250));
+      const server = startShim(config, state, port);
+      const bound = await new Promise<boolean>((resolve) => {
+        const onErr = (err: NodeJS.ErrnoException) => {
+          lastErr = err.code ?? err.message;
+          stopShim(state);
+          resolve(false);
+        };
+        server.once("error", onErr);
+        server.listen(port, PROXY_HOST, () => {
+          server.removeListener("error", onErr);
+          resolve(true);
+        });
       });
-    });
-    if (bound) return "started";
+      if (bound) return "started";
+    }
   }
-  console.warn(`[headroom] path shim unavailable on 127.0.0.1:${port} (${lastErr}); shim-routed providers stay DIRECT this session`);
+  console.warn(`[headroom] path shim unavailable on 127.0.0.1:${base}-${base + 5} (${lastErr}); shim-routed providers stay DIRECT this session`);
   return "failed";
 }
 
@@ -505,7 +515,7 @@ export function registerOverrides(
   for (const { id, upstream, viaShim } of enabled) {
     if (viaShim && !shimOk) continue;
     const header = viaShim
-      ? `http://${PROXY_HOST}:${shimPort(config)}/${id}`
+      ? `http://${PROXY_HOST}:${state.shimPort ?? shimPort(config)}/${id}`
       : stripTrailingV1(upstream);
     pi.registerProvider(id, {
       baseUrl: proxyBase,
