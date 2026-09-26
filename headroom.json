@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "Config for the headroom folder extension. Missing or broken file -> built-in defaults, same behavior.",
+    "Provider upstreams come straight from ../../models.json (pi's own manifest) - no copies here.",
+    "This map only carries per-provider overrides: enabled (default: true, except built-in defaults),",
+    "baseUrl override, shim override (default: automatic - providers whose chat path does not end in /v1",
+    "route through the in-process path shim at 127.0.0.1:8790).",
+    "freetoken: disabled - loopback upstream rejected by Headroom's SSRF guard; no compression value.",
+    "nube: disabled - upstream resets proxied requests (E2E 2026-09-26).",
+    "zai-paas / zai-paasv2: enabled, auto-shimmed (real path /api/coding/paas/v4/chat/completions).",
+    "extraEnv feeds the proxy process. SSL_CERT_FILE et al. point at the exported Windows root bundle",
+    "(~/.headroom/win-ca-bundle.pem) because this machine TLS-intercepts (plan D13)."
+  ],
+  "port": 8787,
+  "shimPort": 8790,
+  "profile": "balanced",
+  "beacon": "off",
+  "telemetry": "on",
+  "command": "headroom",
+  "healthTimeoutMs": 20000,
+  "extraEnv": {
+    "SSL_CERT_FILE": "C:/Users/utama/.headroom/win-ca-bundle.pem",
+    "REQUESTS_CA_BUNDLE": "C:/Users/utama/.headroom/win-ca-bundle.pem",
+    "CURL_CA_BUNDLE": "C:/Users/utama/.headroom/win-ca-bundle.pem"
+  },
+  "providers": {
+    "freetoken": { "enabled": false },
+    "nube": { "enabled": false }
+  }
+}
