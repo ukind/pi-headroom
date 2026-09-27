@@ -6,7 +6,8 @@
 // extensions/mistral-glm/index.ts (apiKey-omitting registerProvider).
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -47,6 +48,7 @@ export interface HeadroomState {
   version: string | null;
   shim: Server | null;
   shimPort: number | null;
+  lastSpawnError: string | null;
 }
 
 // ---------------------------------------------------------------- constants
@@ -178,7 +180,7 @@ export function auditProxyEnv(): string | null {
 // ---------------------------------------------------------------- process manager
 
 export function createState(): HeadroomState {
-  return { child: null, adopted: false, registered: [], version: null, shim: null, shimPort: null };
+  return { child: null, adopted: false, registered: [], version: null, shim: null, shimPort: null, lastSpawnError: null };
 }
 
 export function proxyPort(config: HeadroomConfig): number {
@@ -283,14 +285,42 @@ export function modelLimitsEnv(config: HeadroomConfig): Record<string, string> {
   return { HEADROOM_MODEL_LIMITS: JSON.stringify({ context_limits: limits }) };
 }
 
+// A CA-bundle path that does not exist is not inert: headroom's Python clients raise
+// "Could not find a suitable TLS CA certificate bundle, invalid path ..." on EVERY
+// upstream call, so a bundle path copied onto a machine that never exported one kills
+// all proxied traffic there. Drop dead paths, and auto-use the README step 3 location
+// (~/.headroom/win-ca-bundle.pem) when it exists, so a bare drop-in of this folder
+// works with no config edits on both intercepted and plain machines.
+const CA_KEYS = ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"] as const;
+const DEFAULT_CA_BUNDLE = `${homedir().replace(/\\/g, "/")}/.headroom/win-ca-bundle.pem`;
+
+export function sanitizedExtraEnv(config: HeadroomConfig): Record<string, string> {
+  const extra = { ...(config.extraEnv ?? {}) };
+  for (const key of CA_KEYS) {
+    const value = extra[key];
+    if (value && !existsSync(value)) {
+      console.warn(`[headroom] extraEnv.${key} points at a missing file (${value}); dropped so the proxy still works here`);
+      delete extra[key];
+    }
+  }
+  return extra;
+}
+
+export function caBundleEnv(extra: Record<string, string>): Record<string, string> {
+  if (extra.SSL_CERT_FILE || !existsSync(DEFAULT_CA_BUNDLE)) return {};
+  return { SSL_CERT_FILE: DEFAULT_CA_BUNDLE, REQUESTS_CA_BUNDLE: DEFAULT_CA_BUNDLE, CURL_CA_BUNDLE: DEFAULT_CA_BUNDLE };
+}
+
 function proxyEnv(config: HeadroomConfig, shimNeeded: boolean): Record<string, string> {
+  const extra = sanitizedExtraEnv(config);
   const env: Record<string, string> = {
     ...rateLimitEnv(config),
     ...modelLimitsEnv(config),
     HEADROOM_SAVINGS_PROFILE: config.profile ?? DEFAULT_CONFIG.profile,
     HEADROOM_BEACON: config.beacon ?? DEFAULT_CONFIG.beacon,
     HEADROOM_TELEMETRY: config.telemetry ?? DEFAULT_CONFIG.telemetry,
-    ...(config.extraEnv ?? {}),
+    ...extra,
+    ...caBundleEnv(extra),
   };
   if (shimNeeded) {
     // Setting HEADROOM_ALLOWED_BASE_URLS replaces Headroom's default allow-public policy with an
@@ -435,6 +465,7 @@ export async function ensureProxyRunning(
   onError?: (err: Error) => void,
 ): Promise<"adopted" | "spawned" | "unavailable"> {
   if (isAlive(state)) return "spawned";
+  state.lastSpawnError = null;
   const origin = proxyOrigin(config);
   const first = await fetchHealth(origin, 1500);
   if (first.healthy) {
@@ -444,8 +475,17 @@ export async function ensureProxyRunning(
   }
   state.adopted = false;
   state.version = await headroomVersion(config);
+  if (state.version === null) {
+    // The CLI is absent or cannot run, so spawning the proxy cannot work either. Fail
+    // now instead of burning healthTimeoutMs waiting on a port nothing will ever own.
+    // shell:true on Windows means a missing command exits non-zero rather than raising
+    // ENOENT, so the version probe is the only reliable signal on every platform.
+    state.lastSpawnError = "cli-missing";
+    return "unavailable";
+  }
   spawnProxy(config, state, defaultUpstreamUrl(config), onError);
   const ok = await waitForHealthy(origin, config.healthTimeoutMs ?? DEFAULT_CONFIG.healthTimeoutMs);
+  if (!ok) state.lastSpawnError = "unhealthy";
   return ok ? "spawned" : "unavailable";
 }
 
@@ -653,6 +693,15 @@ export async function onSessionStart(
       }
     }
     state.registered = [];
+    if (state.lastSpawnError === "cli-missing") {
+      state.lastSpawnError = null;
+      warn(
+        "[headroom] the headroom CLI is missing or cannot run - providers left DIRECT. " +
+          'Install it with: uv tool install "headroom-ai[proxy]" (or pip install the same), ' +
+          "then start pi from a NEW terminal: PATH changes never reach an already-open shell.",
+      );
+      return;
+    }
     warn(
       `[headroom] proxy unavailable after ${config.healthTimeoutMs ?? DEFAULT_CONFIG.healthTimeoutMs} ms — ` +
         'stale overrides removed, providers left DIRECT. Install with: uv tool install "headroom-ai[proxy]", ' +

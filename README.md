@@ -38,7 +38,7 @@ git clone https://github.com/ukind/pi-headroom "$env:USERPROFILE\.pi\agent\exten
 # or copy the folder manually — same result
 ```
 
-### 3. (Only on TLS-intercepted machines) export the Windows root bundle
+### 3. (Only on TLS-intercepted machines) export the Windows root bundle — optional
 
 If your network TLS-intercepts HTTPS (corporate root in the Windows store), Headroom's Python clients fail with `certificate verify failed`. Export the Windows roots once:
 
@@ -46,7 +46,7 @@ If your network TLS-intercepts HTTPS (corporate root in the Windows store), Head
 python -c "import ssl, pathlib; certs=[]; [certs.extend(ssl.enum_certificates(s)) for s in ('ROOT','CA')]; p=pathlib.Path.home()/'.headroom'; p.mkdir(exist_ok=True); (p/'win-ca-bundle.pem').write_text(''.join(ssl.DER_cert_to_PEM_cert(c[0]) for c in dict.fromkeys(certs)))"
 ```
 
-The shipped `headroom.json` already points `extraEnv.SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` at `~/.headroom/win-ca-bundle.pem`. Skip this step on machines without TLS interception (then remove the `extraEnv` block).
+You do not have to edit anything for this to be portable. The extension uses `~/.headroom/win-ca-bundle.pem` automatically when that file exists, and drops any `extraEnv.SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` path that does not exist on this machine — a dead CA path makes Headroom's Python clients reject every upstream call with `Could not find a suitable TLS CA certificate bundle`. So the shipped `headroom.json` can be copied to a plain machine untouched: no bundle there, no CA env vars in the proxy, nothing to remove.
 
 ### 4. Start pi
 
@@ -84,6 +84,8 @@ Upstreams come from `models.json`. This file carries only behavior:
 | `command` | `headroom` | CLI binary to spawn |
 | `healthTimeoutMs` | `20000` | Health-gate budget at session start |
 | `extraEnv` | — | Extra env vars for the spawned proxy (CA bundle, allow-lists) |
+| `rateLimit` | `{ rpm: 600, tpm: 10000000 }` | Headroom's own request/token bucket; `false` = its 60 rpm / 100k tpm defaults |
+| `modelLimits` | built from `models.json` | Context windows pushed into `HEADROOM_MODEL_LIMITS`; `false` = Headroom's 128k guess, or `{ "<model>": n }` to override |
 | `providers.<id>.enabled` | `true` | Route this provider through Headroom |
 | `providers.<id>.baseUrl` | from `models.json` | Upstream override |
 | `providers.<id>.shim` | auto | Force shim on/off; auto = shim when the chat path does not end in `/v1` |
@@ -112,7 +114,10 @@ Shim-routed providers need Headroom to accept a loopback target: the extension a
 - **`proxy unavailable after 20000 ms`** — the `headroom` binary is not on PATH (fresh terminal after install), or the port sits in a Windows excluded port range (Headroom issue #589 — set `"port": 8788`).
 - **`path shim unavailable ... (EADDRINUSE)`** — all of `8790`–`8795` are held (several long-lived pi sessions plus other software). Free one or set `"shimPort": 8796`.
 - **`HTTP_PROXY/HTTPS_PROXY ... NO_PROXY` warning at startup** — add `127.0.0.1,localhost` to `NO_PROXY`; pi's dispatcher has no loopback bypass.
-- **`certificate verify failed` in proxy logs** — TLS interception; do step 3.
+- **`certificate verify failed` in proxy logs** — TLS interception; do step 3. A bundle path that does not exist is dropped (a dead path breaks every upstream call), so the fix is to create the file, then restart pi — `/headroom status` shows whether it was picked up.
+- **`the headroom CLI is missing or cannot run`** — install it with `uv tool install "headroom-ai[proxy]"`, then start pi from a NEW terminal: PATH changes never reach an already-open shell. The extension gives up in ~50 ms here instead of waiting out `healthTimeoutMs`.
+- **Every provider fails at once with `429 status code (no body)`** — that is Headroom's own limiter, not the providers'. Read `curl -s http://127.0.0.1:8787/stats` → `rate_limited_by_source` (`headroom` vs `upstream`) and `rate_limiter`. `/headroom status` prints the live limits.
+- **`/headroom status` prints `WARNING: live proxy tpm=... < configured ...`** — the proxy predates the config. `/headroom restart` cannot fix an ADOPTED proxy (the extension never kills what it did not spawn) and `headroom.json` is read once at load: exit pi, run `taskkill /IM headroom.exe /F`, reopen pi.
 - **Provider turns fail with 401** — Headroom relays your `Authorization` header to the upstream; check the key in `models.json` for that provider.
 
 ## Rollback
