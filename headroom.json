@@ -20,6 +20,7 @@
   "command": "headroom",
   "healthTimeoutMs": 20000,
   "extraEnv": {
+    "HEADROOM_MODE": "token",
     "SSL_CERT_FILE": "C:/Users/utama/.headroom/win-ca-bundle.pem",
     "REQUESTS_CA_BUNDLE": "C:/Users/utama/.headroom/win-ca-bundle.pem",
     "CURL_CA_BUNDLE": "C:/Users/utama/.headroom/win-ca-bundle.pem"
