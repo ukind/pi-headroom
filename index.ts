@@ -438,23 +438,126 @@ export function spawnProxy(
   return child;
 }
 
-export function stopProxy(state: HeadroomState): "stopped" | "not-running" | "adopted" {
-  if (state.adopted) return "adopted";
-  if (!isAlive(state)) return "not-running";
-  const child = state.child!;
-  if (process.platform === "win32" && child.pid) {
-    spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
-  } else {
-    child.kill("SIGTERM");
-  }
-  return "stopped";
+// Resolve the PID of the process listening on the proxy port — the port owner, whether
+// pi spawned it or not. Runs only on explicit /headroom stop / restart, never on
+// session_start (the hot path's only sensing primitive stays fetchHealth).
+// Outcomes are distinct on purpose: null means "no listener on the port" (an observable,
+// healthy state); "lookup-failed" means the lookup tool itself could not run. The two
+// must never conflate, or stop would report "not running" over a live proxy.
+// Modeled on headroomVersion's spawn-probe shape (spawn, capture stdout, resolve on
+// failure). No shell:true — both probes are real executables on PATH, and a direct spawn
+// keeps a cmd.exe wrapper out of the picture.
+export async function findPortOwnerPid(
+  config: HeadroomConfig,
+): Promise<number | null | "lookup-failed"> {
+  const port = proxyPort(config);
+  const win32 = process.platform === "win32";
+  return new Promise((resolve) => {
+    const child = win32
+      ? spawn(
+          "powershell",
+          [
+            "-NoProfile",
+            "-Command",
+            `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ` +
+              "Select-Object -First 1 -ExpandProperty OwningProcess",
+          ],
+          { stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
+        )
+      : spawn("lsof", ["-ti", `tcp:${port}`, "-sTCP:LISTEN"], {
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+    let out = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      out += chunk.toString();
+    });
+    child.on("error", () => resolve("lookup-failed"));
+    child.on("close", (code) => {
+      const pid = Number.parseInt(out.trim(), 10);
+      if (Number.isInteger(pid) && pid > 0) return resolve(pid);
+      // Windows: -ErrorAction SilentlyContinue makes a no-match exit 0 with empty stdout.
+      // POSIX: lsof exits 1 when nothing is found. Both mean "no listener", not failure.
+      if (code === 0 || (!win32 && code === 1)) return resolve(null);
+      resolve("lookup-failed");
+    });
+  });
 }
 
-async function waitForPortFree(origin: string, timeoutMs = 5000): Promise<void> {
+// Awaited, outcome-checked kill — the first in this file (the old stopProxy discarded the
+// taskkill handle, so "stopped" stated intent, not outcome). Exit-code mapping:
+// taskkill 0 -> killed, 128 (PID already gone) -> not-running, anything else -> kill-failed;
+// POSIX ESRCH -> not-running, EPERM/anything else -> kill-failed. /T kills the whole tree,
+// which is load-bearing on win32: shell:true makes the spawned pid a cmd.exe wrapper with
+// the real proxy as a grandchild.
+async function killProcess(pid: number): Promise<"killed" | "not-running" | "kill-failed"> {
+  if (process.platform === "win32") {
+    return new Promise((resolve) => {
+      const child = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      child.on("error", () => resolve("kill-failed"));
+      child.on("close", (code) => {
+        if (code === 0) return resolve("killed");
+        if (code === 128) return resolve("not-running");
+        resolve("kill-failed");
+      });
+    });
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+    return "killed";
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH" ? "not-running" : "kill-failed";
+  }
+}
+
+// The single kill authority. Own live child -> tree-kill via the child handle. Otherwise ->
+// port-owner lookup + PID-scoped kill, which covers adopted, foreign, and manually-started
+// instances. state.adopted is a status-rendering concern, not kill-routing: a stale
+// adopted flag over a dead proxy resolves through the lookup's "no listener" outcome, and
+// every external kill resets adopted here because no close event fires (there is no child
+// handle to observe it).
+export async function stopProxy(
+  config: HeadroomConfig,
+  state: HeadroomState,
+): Promise<"stopped" | "stopped-external" | "not-running" | "lookup-failed" | "kill-failed"> {
+  if (isAlive(state)) {
+    const child = state.child!;
+    if (!child.pid) return "kill-failed"; // cannot identify what to kill
+    const result = await killProcess(child.pid);
+    if (result === "killed") state.adopted = false;
+    return result === "killed" ? "stopped" : result;
+  }
+  const pid = await findPortOwnerPid(config);
+  if (pid === "lookup-failed") return "lookup-failed";
+  if (pid === null) {
+    state.adopted = false; // no listener: the proxy is already down (covers stale adopted)
+    return "not-running";
+  }
+  const result = await killProcess(pid);
+  if (result !== "kill-failed") state.adopted = false; // killed, or the PID was already gone
+  return result === "killed" ? "stopped-external" : result;
+}
+
+// Poll until the port stops answering. Requires N consecutive failed probes before
+// declaring the port free: a taskkill'd external process can keep answering /health
+// while it dies, and a single early-exit probe plus ensureProxyRunning's 1500ms adopt
+// probe (index.ts:470) would re-adopt the corpse (state.adopted = true over a dying
+// process). Two failures is ~2.2s of observed silence at the 200ms poll / 1s probe
+// timeout; the 5s deadline is unchanged. Timeout still returns void as before — the
+// caller's next ensureProxyRunning probe is the real arbiter.
+async function waitForPortFree(origin: string, timeoutMs = 5000, needed = 2): Promise<void> {
   const deadline = Date.now() + timeoutMs;
+  let failures = 0;
   while (Date.now() < deadline) {
     const { healthy } = await fetchHealth(origin, 1000);
-    if (!healthy) return;
+    if (!healthy) {
+      failures++;
+      if (failures >= needed) return;
+    } else {
+      failures = 0;
+    }
     await new Promise((r) => setTimeout(r, 200));
   }
 }
@@ -494,8 +597,20 @@ export async function restartProxy(
   state: HeadroomState,
   onError?: (err: Error) => void,
 ): Promise<"adopted" | "spawned" | "unavailable"> {
-  const stopped = stopProxy(state);
-  if (stopped !== "adopted") await waitForPortFree(proxyOrigin(config));
+  // FR5: restart kills ANY running instance now — the old skip-wait guard that treated
+  // an adopted proxy as untouchable made restart a no-op round-trip. Always wait for the
+  // port to free afterwards: a "not-running" from the own-child branch means the wrapper PID is
+  // gone (taskkill exit 128 / ESRCH), NOT that the port-owning grandchild released the
+  // socket, so the probe gate (N=2 consecutive failures) is the only trusted evidence
+  // the port is free. The ~0.2s cost when nothing was running (probes fail fast with
+  // ECONNREFUSED) is acceptable on a manual command.
+  // A failed kill or failed lookup aborts the restart: proceeding would re-adopt the
+  // surviving instance and report success over an un-killed proxy — exactly the outcome
+  // the kill-failed union member exists to surface. The command branch renders
+  // "unavailable" as an error notify.
+  const stopped = await stopProxy(config, state);
+  if (stopped === "kill-failed" || stopped === "lookup-failed") return "unavailable";
+  await waitForPortFree(proxyOrigin(config));
   return ensureProxyRunning(config, state, onError);
 }
 
@@ -743,8 +858,13 @@ export async function onSessionStart(
   }
 }
 
+// FR3: the proxy is a machine-level singleton — session_shutdown fires on /new, /resume,
+// AND process exit (prior FRD evidence: dist/core/agent-session.js:2606, CHANGELOG.md:2089),
+// so killing here churned the proxy on every session change. Only /headroom stop ends it
+// now. The shim stays per-session by design (its port ladder and closeAllConnections
+// teardown are what make back-to-back /new rebinds work), and adopted/version bookkeeping
+// self-heals on the next session_start re-probe.
 export function onSessionShutdown(state: HeadroomState): void {
-  stopProxy(state);
   stopShim(state);
   state.child = null;
   state.registered = [];
@@ -765,7 +885,7 @@ async function handleHeadroomCommand(
   if (sub === "status") {
     const lines: string[] = [];
     if (state.adopted) {
-      lines.push(`proxy: external instance on 127.0.0.1:${proxyPort(config)} (not spawned by pi; /headroom stop will not touch it)`);
+      lines.push(`proxy: external instance on 127.0.0.1:${proxyPort(config)} (not spawned by pi; /headroom stop WILL kill it via the port-owner PID)`);
     } else if (isAlive(state)) {
       lines.push(`proxy: running (pid ${state.child?.pid}, port ${proxyPort(config)})`);
     } else {
@@ -812,8 +932,8 @@ async function handleHeadroomCommand(
           if (wantTpm && tpm < wantTpm) {
             lines.push(
               `WARNING: live proxy tpm=${tpm} < configured ${wantTpm}, so this proxy predates the config. ` +
-                "/headroom restart cannot fix an adopted proxy. Fix: exit pi, run " +
-                "taskkill /IM headroom.exe /F, then reopen pi (config is read once at load).",
+                "Fix: /headroom restart — it now kills any running instance (including adopted ones) " +
+                "and respawns with the current config (headroom.json is read once at load, so edit it first).",
             );
           }
         }
@@ -837,10 +957,15 @@ async function handleHeadroomCommand(
   }
 
   if (sub === "stop") {
-    const result = stopProxy(state);
-    if (result === "adopted") notify("proxy is an external instance — not stopped", "warning");
+    const result = await stopProxy(config, state);
+    if (result === "stopped")
+      notify("proxy stopped (pi-spawned instance); providers still wired — turns will error until /headroom restart");
+    else if (result === "stopped-external")
+      notify("proxy stopped (external instance killed via port-owner PID); providers still wired — turns will error until /headroom restart");
     else if (result === "not-running") notify("proxy not running", "warning");
-    else notify("proxy stopped (providers still wired: turns will error until /headroom restart)");
+    else if (result === "lookup-failed")
+      notify(`proxy not stopped — the port-owner lookup failed on port ${proxyPort(config)} (is Get-NetTCPConnection/lsof available?)`, "error");
+    else notify("proxy kill failed — the process may still be running; /headroom status to confirm", "error");
     return;
   }
 

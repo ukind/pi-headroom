@@ -16,7 +16,7 @@ pi ──> headroom proxy (127.0.0.1:8787) ──> upstream
 ```
 
 - `session_start`: the extension adopts or spawns `headroom proxy`, health-gates it, starts the in-process shim (only if any provider needs it), and override-registers every enabled provider via `pi.registerProvider` (baseUrl -> proxy, `x-headroom-base-url` header -> upstream). API keys never leave your `models.json`.
-- `session_shutdown`: kills only the proxy this extension spawned, stops the shim. An external proxy you started yourself is adopted, never killed.
+- `session_shutdown`: stops the shim and clears in-process handles. The proxy is a machine-level singleton — it survives `/new`, `/resume`, and process exit. Only `/headroom stop` leaves it stopped (`/headroom restart` kills and immediately respawns).
 - Upstream addresses are read **directly from `~/.pi/agent/models.json`** — no URL copies to maintain.
 
 ## Install (end to end)
@@ -106,8 +106,8 @@ Shim-routed providers need Headroom to accept a loopback target: the extension a
 ## Commands
 
 - `/headroom status` — proxy state, version, shim state, wired/disabled lists
-- `/headroom stop` — stop the proxy (only one this extension spawned); providers stay wired until restart
-- `/headroom restart` — stop + health-gated start
+- `/headroom stop` — stop the proxy, whichever process owns the port (pi-spawned via its child handle, adopted/external via a port-owner PID lookup); providers stay wired until restart
+- `/headroom restart` — kill any running instance + health-gated start
 
 ## Troubleshooting
 
@@ -117,7 +117,7 @@ Shim-routed providers need Headroom to accept a loopback target: the extension a
 - **`certificate verify failed` in proxy logs** — TLS interception; do step 3. A bundle path that does not exist is dropped (a dead path breaks every upstream call), so the fix is to create the file, then restart pi — `/headroom status` shows whether it was picked up.
 - **`the headroom CLI is missing or cannot run`** — install it with `uv tool install "headroom-ai[proxy]"`, then start pi from a NEW terminal: PATH changes never reach an already-open shell. The extension gives up in ~50 ms here instead of waiting out `healthTimeoutMs`.
 - **Every provider fails at once with `429 status code (no body)`** — that is Headroom's own limiter, not the providers'. Read `curl -s http://127.0.0.1:8787/stats` → `rate_limited_by_source` (`headroom` vs `upstream`) and `rate_limiter`. `/headroom status` prints the live limits.
-- **`/headroom status` prints `WARNING: live proxy tpm=... < configured ...`** — the proxy predates the config. `/headroom restart` cannot fix an ADOPTED proxy (the extension never kills what it did not spawn) and `headroom.json` is read once at load: exit pi, run `taskkill /IM headroom.exe /F`, reopen pi.
+- **`/headroom status` prints `WARNING: live proxy tpm=... < configured ...`** — the proxy predates the config. `/headroom restart` fixes this: it now kills any running instance (including adopted ones) and respawns with the current config (`headroom.json` is read once at load, so edit it before restarting).
 - **Provider turns fail with 401** — Headroom relays your `Authorization` header to the upstream; check the key in `models.json` for that provider.
 
 ## Rollback
