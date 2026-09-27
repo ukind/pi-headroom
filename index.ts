@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 // ---------------------------------------------------------------- types
 
@@ -998,6 +999,76 @@ export default function headroomExtension(pi: ExtensionAPI): void {
   pi.registerCommand("headroom", {
     description: "Headroom proxy: /headroom status|stop|restart",
     handler: (args: string, ctx: ExtensionCommandContext) => handleHeadroomCommand(args, ctx, config, state),
+  });
+
+  // CCR redemption: the proxy compresses tool output and leaves a marker
+  // (`<<ccr:HASH ...>>` or `Retrieve more: hash=HASH`). On pi's streaming chat
+  // path the proxy deliberately does NOT inject its own headroom_retrieve tool
+  // (headroom/proxy/handlers/openai.py: _should_inject_openai_chat_ccr_tool
+  // returns `ccr_inject_tool and not stream`), so the model would hold markers
+  // it cannot redeem. This tool closes that loop against the proxy's loopback
+  // GET /v1/retrieve/{hash} endpoint.
+  pi.registerTool({
+    name: "headroom_retrieve",
+    label: "Headroom Retrieve",
+    description:
+      "Retrieve the original, uncompressed content behind a Headroom CCR marker. " +
+      "When Headroom compresses tool output it leaves a marker such as " +
+      "`<<ccr:HASH N_items_offloaded>>` or `Retrieve more: hash=HASH`. " +
+      "Call this with that hash to get the full original text back. " +
+      "This is Headroom, not the accordion extension: accordion folds look like " +
+      "`{#3f9a2c FOLDED}` and use the recall/unfold tools. Never pass a `<<ccr:...>>` " +
+      "hash to recall or unfold — they cannot resolve it.",
+    promptSnippet: "Retrieve original content behind a <<ccr:HASH>> compression marker",
+    promptGuidelines: [
+      "Two different compression markers can appear in tool output. `<<ccr:HASH ...>>` or " +
+        "`[N items compressed to M. Retrieve more: hash=HASH]` is Headroom CCR: use headroom_retrieve.",
+      "`{#3f9a2c FOLDED}` is an accordion fold: use recall or unfold. Never send a `<<ccr:...>>` hash " +
+        "to recall or unfold, and never send a `{#... FOLDED}` code to headroom_retrieve.",
+      "When you need the full text behind a `<<ccr:...>>` marker, call headroom_retrieve with the hash. " +
+        "Do not assume the content is lost and do not re-run the original command.",
+    ],
+    parameters: Type.Object({
+      hash: Type.String({
+        description: "The hash from the marker (the `ccr:` prefix and surrounding text are ignored).",
+      }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const match = /[a-f0-9]{12,24}/i.exec(params.hash ?? "");
+      if (!match) {
+        return { content: [{ type: "text", text: `No hash found in "${params.hash}".` }] };
+      }
+      const hash = match[0];
+      const origin = `http://${PROXY_HOST}:${config.port ?? DEFAULT_CONFIG.port}`;
+      const { healthy, body } = await fetchHealth(origin, 5000, `/v1/retrieve/${hash}`);
+      if (!healthy) {
+        let detail = "";
+        if (body) {
+          try {
+            detail = (JSON.parse(body) as { detail?: string }).detail ?? body;
+          } catch {
+            detail = body;
+          }
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Headroom retrieve failed for ${hash}${detail ? `: ${detail}` : ": the proxy is not reachable."}`,
+            },
+          ],
+        };
+      }
+      let parsed: { original_content?: unknown };
+      try {
+        parsed = JSON.parse(body) as { original_content?: unknown };
+      } catch {
+        return { content: [{ type: "text", text: body }] };
+      }
+      const original = parsed.original_content;
+      const text = typeof original === "string" ? original : JSON.stringify(original ?? parsed, null, 2);
+      return { content: [{ type: "text", text }] };
+    },
   });
 
   pi.on("session_start", async (_event, ctx) => {
