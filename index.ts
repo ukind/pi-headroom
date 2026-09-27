@@ -117,7 +117,13 @@ export function readManifestProviders(): Record<string, { baseUrl: string; api?:
       }
     }
     return out;
-  } catch {
+  } catch (err) {
+    // Silent is the worst outcome here: zero providers wired looks like a working extension.
+    console.warn(
+      `[headroom] cannot read the provider manifest at ${MANIFEST_URL} ` +
+        `(${(err as Error).message}) — wiring ZERO providers. This path assumes the folder sits ` +
+        `at <agent-dir>/extensions/headroom/.`,
+    );
     return {};
   }
 }
@@ -197,6 +203,17 @@ export function shimPortCandidates(config: HeadroomConfig): number[] {
 // providers need the shim ports in HEADROOM_ALLOWED_BASE_URLS. The allow-list is baked
 // into the spawned proxy's env before we know which port binds, so it covers every
 // candidate. Union with the user's extraEnv value; explicit entries always survive.
+// Authority (host, or host:port) of an upstream URL. Headroom matches the
+// x-headroom-base-url target on this form, so the URL path is dropped.
+function upstreamAuthority(upstream: string): string | null {
+  try {
+    const u = new URL(upstream);
+    return u.port ? `${u.hostname}:${u.port}` : u.hostname;
+  } catch {
+    return null;
+  }
+}
+
 function proxyEnv(config: HeadroomConfig, shimNeeded: boolean): Record<string, string> {
   const env: Record<string, string> = {
     HEADROOM_SAVINGS_PROFILE: config.profile ?? DEFAULT_CONFIG.profile,
@@ -205,9 +222,18 @@ function proxyEnv(config: HeadroomConfig, shimNeeded: boolean): Record<string, s
     ...(config.extraEnv ?? {}),
   };
   if (shimNeeded) {
-    const ours = shimPortCandidates(config).map((p) => `${PROXY_HOST}:${p}`).join(",");
+    // Setting HEADROOM_ALLOWED_BASE_URLS replaces Headroom's default allow-public policy with an
+    // explicit allow-list. A base-url that is not listed is NOT rejected loudly: the proxy falls
+    // back to its own --openai-api-url, so provider A's traffic leaves with provider B's key.
+    // Listing only the shim ports broke every direct provider that way (2026-09-27: hyper's key
+    // reached api.z.ai -> 401 "token expired or incorrect", and all traffic piled onto one
+    // upstream -> repeated 429). Allow the shim ports AND every wired upstream.
+    const ours = [
+      ...shimPortCandidates(config).map((p) => `${PROXY_HOST}:${p}`),
+      ...resolveProviders(config).enabled.map((p) => upstreamAuthority(p.upstream)).filter((a): a is string => a !== null),
+    ];
     const theirs = env.HEADROOM_ALLOWED_BASE_URLS;
-    env.HEADROOM_ALLOWED_BASE_URLS = theirs ? `${theirs},${ours}` : ours;
+    env.HEADROOM_ALLOWED_BASE_URLS = theirs ? `${theirs},${ours.join(",")}` : ours.join(",");
   }
   return env;
 }
