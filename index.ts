@@ -28,6 +28,8 @@ export interface HeadroomConfig {
   command?: string;
   healthTimeoutMs?: number;
   extraEnv?: Record<string, string>;
+  rateLimit?: { rpm?: number; tpm?: number } | false;
+  modelLimits?: Record<string, number> | false;
   providers?: Record<string, ProviderEntry>;
   [key: string]: unknown;
 }
@@ -73,6 +75,7 @@ export const DEFAULT_CONFIG = {
   healthTimeoutMs: 20_000,
 } as const;
 
+export const DEFAULT_RATE_LIMIT = { rpm: 600, tpm: 10_000_000 } as const;
 export const DEFAULT_UPSTREAM_ARG = "hyper";
 export const MIN_VERSION = [0, 38, 0] as const;
 
@@ -214,8 +217,76 @@ function upstreamAuthority(upstream: string): string | null {
   }
 }
 
+// headroom's token-bucket limiter defaults to 60 requests + 100,000 tokens per MINUTE,
+// keyed per inbound API key, and it answers 429 itself without ever contacting the
+// provider. A single pi turn legitimately carries 80K-120K tokens (measured 2026-09-27:
+// PERF tok_before=87240/90396, inbound bodies up to 494KB; /stats reports
+// rate_limited_by_source{source="headroom"}=167 vs {source="upstream"}=0), so ONE request
+// can exceed the whole per-minute budget. pi's router then reads that local 429 as
+// "provider rate-limited", walks every provider in the tier (hyper, ollama-cloud,
+// zai-paas and zai-paasv2 were all rejected inside the same 150ms window), and dies with
+// "429 status code (no body)". Raise the ceiling so headroom stops being the limit source
+// and leave real limiting to the providers. Opt back down with rateLimit:false (headroom's
+// own defaults) or an explicit { rpm, tpm }; extraEnv can still override either.
+export function rateLimitEnv(config: HeadroomConfig): Record<string, string> {
+  const rl = config.rateLimit;
+  if (rl === false) return {};
+  const rpm = rl?.rpm ?? DEFAULT_RATE_LIMIT.rpm;
+  const tpm = rl?.tpm ?? DEFAULT_RATE_LIMIT.tpm;
+  const env: Record<string, string> = {};
+  if (Number.isInteger(rpm) && rpm > 0) env.HEADROOM_RPM = String(rpm);
+  if (Number.isInteger(tpm) && tpm > 0) env.HEADROOM_TPM = String(tpm);
+  return env;
+}
+
+// models.json model entries carry contextWindow; headroom defaults unknown models to
+// 128,000 tokens, which is below real windows (glm-5.3-flash: 1,000,000) and above others,
+// so its compression math runs against a wrong ceiling either way. Feed every manifest
+// model in so the proxy sees the true window. Same id on two providers with different
+// windows: take the minimum - headroom matches by id only and cannot tell providers
+// apart, so the smallest window is the only safe ceiling. modelLimits:false restores
+// headroom's defaults; explicit entries override the manifest.
+export function readManifestModelLimits(): Record<string, number> {
+  try {
+    const parsed = JSON.parse(readFileSync(MANIFEST_URL, "utf-8")) as {
+      providers?: Record<string, { models?: Array<{ id?: string; contextWindow?: number }> }>;
+    };
+    const out: Record<string, number> = {};
+    for (const provider of Object.values(parsed.providers ?? {})) {
+      for (const model of provider.models ?? []) {
+        if (
+          model &&
+          typeof model.id === "string" &&
+          model.id.length > 0 &&
+          typeof model.contextWindow === "number" &&
+          model.contextWindow > 0
+        ) {
+          const prev = out[model.id];
+          out[model.id] = prev === undefined ? model.contextWindow : Math.min(prev, model.contextWindow);
+        }
+      }
+    }
+    return out;
+  } catch (err) {
+    console.warn(
+      `[headroom] cannot read model limits from ${MANIFEST_URL} (${(err as Error).message}); ` +
+        "headroom falls back to its 128,000-token default per unknown model",
+    );
+    return {};
+  }
+}
+
+export function modelLimitsEnv(config: HeadroomConfig): Record<string, string> {
+  if (config.modelLimits === false) return {};
+  const limits = { ...readManifestModelLimits(), ...(config.modelLimits ?? {}) };
+  if (Object.keys(limits).length === 0) return {};
+  return { HEADROOM_MODEL_LIMITS: JSON.stringify({ context_limits: limits }) };
+}
+
 function proxyEnv(config: HeadroomConfig, shimNeeded: boolean): Record<string, string> {
   const env: Record<string, string> = {
+    ...rateLimitEnv(config),
+    ...modelLimitsEnv(config),
     HEADROOM_SAVINGS_PROFILE: config.profile ?? DEFAULT_CONFIG.profile,
     HEADROOM_BEACON: config.beacon ?? DEFAULT_CONFIG.beacon,
     HEADROOM_TELEMETRY: config.telemetry ?? DEFAULT_CONFIG.telemetry,
@@ -274,10 +345,14 @@ export function versionAtLeast(version: string | null, min: readonly [number, nu
   return true;
 }
 
-export function fetchHealth(origin: string, timeoutMs: number): Promise<{ healthy: boolean; body: string | null }> {
+export function fetchHealth(
+  origin: string,
+  timeoutMs: number,
+  path = "/health",
+): Promise<{ healthy: boolean; body: string | null }> {
   return new Promise((resolve) => {
     const req = httpRequest(
-      `${origin}/health`,
+      `${origin}${path}`,
       { timeout: timeoutMs },
       (res) => {
         let body = "";
@@ -665,6 +740,38 @@ async function handleHeadroomCommand(
     lines.push(`wired (${state.registered.length}): ${state.registered.length > 0 ? state.registered.join(", ") : "none"}`);
     const { skipped } = resolveProviders(config);
     if (skipped.length > 0) lines.push(`not wired (disabled): ${skipped.join(", ")}`);
+    const want = rateLimitEnv(config);
+    const ml = modelLimitsEnv(config);
+    if (ml.HEADROOM_MODEL_LIMITS) {
+      try {
+        const n = Object.keys(JSON.parse(ml.HEADROOM_MODEL_LIMITS).context_limits as Record<string, number>).length;
+        lines.push(`model limits: ${n} models from models.json (headroom default is 128,000)`);
+      } catch {
+        // unreachable: modelLimitsEnv only emits valid JSON
+      }
+    }
+    const stats = await fetchHealth(proxyOrigin(config), 2000, "/stats");
+    if (stats.healthy && stats.body) {
+      try {
+        const rl = (JSON.parse(stats.body) as {
+          rate_limiter?: { requests_per_minute?: number; tokens_per_minute?: number };
+        }).rate_limiter;
+        const tpm = rl?.tokens_per_minute;
+        if (typeof tpm === "number") {
+          lines.push(`rate limit: ${rl?.requests_per_minute} rpm / ${tpm} tpm (below these headroom 429s on its own)`);
+          const wantTpm = want.HEADROOM_TPM ? Number(want.HEADROOM_TPM) : null;
+          if (wantTpm && tpm < wantTpm) {
+            lines.push(
+              `WARNING: live proxy tpm=${tpm} < configured ${wantTpm}, so this proxy predates the config. ` +
+                "/headroom restart cannot fix an adopted proxy. Fix: exit pi, run " +
+                "taskkill /IM headroom.exe /F, then reopen pi (config is read once at load).",
+            );
+          }
+        }
+      } catch {
+        // /stats not JSON -> skip the rate-limit line
+      }
+    }
     const { healthy, body } = await fetchHealth(proxyOrigin(config), 2000);
     if (healthy && body) {
       try {
