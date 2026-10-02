@@ -1066,7 +1066,11 @@ export default function headroomExtension(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: body }] };
       }
       const original = parsed.original_content;
-      const text = typeof original === "string" ? original : JSON.stringify(original ?? parsed, null, 2);
+      // Byte-differentiation guard: the proxy's CompressionCache re-hashes this result next turn (raw-byte md5) and swaps it back to its <<ccr:...>> marker before the router's name exemption runs; one trailing newline breaks the hash.
+      // Ceiling: if any layer trims trailing whitespace before hashing, byte-equality is restored and this fails silently.
+      // Contingency: HEADROOM_NO_CCR=1 — extension-spawned proxies only (adopted ones never see proxyEnv, index.ts:322/:427-429).
+      const text =
+        (typeof original === "string" ? original : JSON.stringify(original ?? parsed, null, 2)) + "\n";
       return { content: [{ type: "text", text }] };
     },
   });
