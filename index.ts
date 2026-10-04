@@ -386,11 +386,18 @@ export function fetchHealth(
       `${origin}${path}`,
       { timeout: timeoutMs },
       (res) => {
-        let body = "";
+        // FR2: accumulate raw Buffers and decode once — per-chunk toString() splits
+        // multi-byte UTF-8 sequences at chunk boundaries (U+FFFD). JSON structure is
+        // ASCII so JSON.parse still succeeds: the corruption is silent, in the content
+        // the success path returns.
+        const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => {
-          body += chunk.toString();
+          chunks.push(chunk);
         });
-        res.on("end", () => resolve({ healthy: res.statusCode === 200, body: body || null }));
+        res.on("end", () => {
+          const body = Buffer.concat(chunks).toString("utf-8");
+          resolve({ healthy: res.statusCode === 200, body: body || null });
+        });
       },
     );
     req.on("timeout", () => {
@@ -797,6 +804,15 @@ export async function onSessionStart(
   const envWarning = auditProxyEnv();
   if (envWarning) warn("[headroom] " + envWarning);
 
+  // FR5: activate headroom_retrieve directly in every session. Extension tools start
+  // inactive (agent-session.js:2890-2892 activates only read/bash/edit/write), so the
+  // tool was reachable only via tool_search or codemode nesting — and a codemode-nested
+  // result is named "codemode", which the proxy's name-keyed CCR exemption misses.
+  // session_start re-fires on /new and /resume, so activation re-applies however the
+  // runtime resets actives. Placed before the proxy checks: the tool stays callable
+  // when the proxy is down, and its "proxy is not reachable" error is the diagnostic.
+  pi.setActiveTools([...pi.getActiveTools(), "headroom_retrieve"]);
+
   const result = await ensureProxyRunning(config, state, (err) =>
     warn(`[headroom] proxy spawn error: ${err.message}`),
   );
@@ -1039,7 +1055,9 @@ export default function headroomExtension(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: `No hash found in "${params.hash}".` }] };
       }
       const hash = match[0];
-      const origin = `http://${PROXY_HOST}:${config.port ?? DEFAULT_CONFIG.port}`;
+      // FR4: validated accessor path — the raw config.port dial bypassed proxyPort's
+      // integer/range validation (the lone outlier among the call sites).
+      const origin = proxyOrigin(config);
       const { healthy, body } = await fetchHealth(origin, 5000, `/v1/retrieve/${hash}`);
       if (!healthy) {
         let detail = "";
@@ -1063,7 +1081,8 @@ export default function headroomExtension(pi: ExtensionAPI): void {
       try {
         parsed = JSON.parse(body) as { original_content?: unknown };
       } catch {
-        return { content: [{ type: "text", text: body }] };
+        // Same byte-differentiation as the success return below — see the guard comment there.
+        return { content: [{ type: "text", text: body + "\n" }] };
       }
       const original = parsed.original_content;
       // Byte-differentiation guard: the proxy's CompressionCache re-hashes this result next turn (raw-byte md5) and swaps it back to its <<ccr:...>> marker before the router's name exemption runs; one trailing newline breaks the hash.
