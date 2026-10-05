@@ -1,3 +1,13 @@
 # pi + rpiv local state (never part of the extension)
 .pi/
-.rpiv/
+# .rpiv is local state, EXCEPT the two phase-1 deliverables of the
+# 2026-10-05 retrieve-recompression plan (the falsification harness),
+# which must be visible to git. Cannot negate below a fully-ignored
+# dir, hence the /* restructure. Everything else stays local.
+.rpiv/*
+!.rpiv/tmp/
+.rpiv/tmp/*
+!.rpiv/tmp/hdrv/
+.rpiv/tmp/hdrv/*
+!.rpiv/tmp/hdrv/test_retrieve_forms.py
+!.rpiv/tmp/hdrv/driver_e2e.mjs
