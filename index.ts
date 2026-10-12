@@ -34,7 +34,15 @@ export interface HeadroomConfig {
   rateLimit?: { rpm?: number; tpm?: number } | false;
   modelLimits?: Record<string, number> | false;
   providers?: Record<string, ProviderEntry>;
-  [key: string]: unknown;
+  // F028: set HEADROOM_NO_CCR=1 on the spawned proxy - the escape hatch
+  // headroom_retrieve's byte-differentiation guard already names, for the day some
+  // layer starts trimming trailing whitespace. Off by default: the trailing newline
+  // is the working fix (F-V07). Reaches only pi-spawned proxies (adopted ones never
+  // see proxyEnv).
+  noCcr?: boolean;
+  // F011: headroom.json's own prose comments. Declared explicitly so dropping the
+  // index signature below does not make the file's own keys unknown.
+  _comment?: string[];
 }
 
 export interface ResolvedProvider {
@@ -93,11 +101,37 @@ export function stripTrailingV1(upstream: string): string {
 
 // ---------------------------------------------------------------- config layer
 
+// F011: the known top-level keys of headroom.json. With HeadroomConfig's index
+// signature gone, a typo is a compile error at every internal use site - but
+// headroom.json is user data parsed at runtime, so loadConfig also warns on unknown
+// keys instead of silently falling back to the default (the "healthTimoutMs" case:
+// accepted, ignored, no message).
+const CONFIG_KEYS: ReadonlySet<string> = new Set([
+  "port",
+  "shimPort",
+  "profile",
+  "beacon",
+  "telemetry",
+  "command",
+  "healthTimeoutMs",
+  "extraEnv",
+  "rateLimit",
+  "modelLimits",
+  "providers",
+  "noCcr",
+  "_comment",
+]);
+
 export function loadConfig(): HeadroomConfig {
   try {
     const parsed = JSON.parse(readFileSync(CONFIG_URL, "utf-8")) as HeadroomConfig;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("not a JSON object");
+    }
+    for (const key of Object.keys(parsed)) {
+      if (!CONFIG_KEYS.has(key)) {
+        console.warn(`[headroom] ignoring unknown headroom.json key '${key}'`);
+      }
     }
     return parsed;
   } catch (err) {
@@ -140,19 +174,47 @@ export function readManifestProviders(): Record<string, { baseUrl: string; api?:
 // The optional manifest parameter is the DI seam (D5): tests inject a manifest
 // instead of reading the machine's live models.json, so the suite is hermetic and
 // cannot pass or fail on whichever providers happen to be installed here.
+// F009: resolveProviders re-read and re-parsed the 38,975-byte models.json on every
+// call - eight call sites plus modelLimitsEnv's two, so one session start performed
+// ten synchronous reads of the same file, and the shim-failure path's up-to-12
+// startShim attempts multiplied it. Memoize per config object: the factory creates
+// one config per load (index.ts:1011) and the restart-branch re-read creates a fresh
+// object, so object identity is a safe key (D9). The DI seam (D5) is preserved
+// exactly - an injected manifest always computes fresh, so tests cannot pass
+// vacuously against a stale entry; only the default read is memoized. Callers treat
+// the result as read-only.
+const providerResolutionCache = new WeakMap<
+  HeadroomConfig,
+  { enabled: ResolvedProvider[]; skipped: string[] }
+>();
+
 export function resolveProviders(
   config: HeadroomConfig,
-  manifest: Record<string, { baseUrl: string; api?: string }> = readManifestProviders(),
+  manifest?: Record<string, { baseUrl: string; api?: string }>,
 ): {
   enabled: ResolvedProvider[];
   skipped: string[];
 } {
+  if (manifest === undefined) {
+    const cached = providerResolutionCache.get(config);
+    if (cached) return cached;
+  }
+  const source = manifest ?? readManifestProviders();
   const enabled: ResolvedProvider[] = [];
   const skipped: string[] = [];
   const entries = config.providers ?? {};
-  for (const id of Object.keys(manifest)) {
-    const info = manifest[id]!;
-    if (info.api && info.api !== "openai-completions") continue;
+  for (const id of Object.keys(source)) {
+    const info = source[id]!;
+    if (info.api && info.api !== "openai-completions") {
+      // F050: non-openai-completions providers used to vanish silently - neither
+      // enabled nor skipped - so /headroom status could not account for them. They
+      // cannot be wired (Headroom speaks the OpenAI path shape), so say so once
+      // instead of dropping them.
+      console.warn(
+        `[headroom] provider '${id}' uses api '${info.api}', not openai-completions; not wired`,
+      );
+      continue;
+    }
     const entry = entries[id] ?? {};
     const isEnabled = entry.enabled ?? !(id in DEFAULT_DISABLED);
     if (!isEnabled) {
@@ -163,7 +225,19 @@ export function resolveProviders(
     const viaShim = entry.shim ?? !endsWithV1(upstream);
     enabled.push({ id, upstream, viaShim });
   }
-  return { enabled, skipped };
+  // F012: the loop iterates manifest keys, so a providers.<id> block whose id is
+  // absent from models.json was never visited - a renamed provider lost all its
+  // flags with no signal. Warn on the difference.
+  for (const id of Object.keys(entries)) {
+    if (!(id in source)) {
+      console.warn(
+        `[headroom] providers.${id} in headroom.json is not in models.json; ignored`,
+      );
+    }
+  }
+  const result = { enabled, skipped };
+  if (manifest === undefined) providerResolutionCache.set(config, result);
+  return result;
 }
 
 export function auditProxyEnv(): string | null {
@@ -295,14 +369,25 @@ export function readManifestModelLimits(): Record<string, number> {
 // The optional manifestLimits parameter is the DI seam (D5): same hidden-fs dependency
 // as resolveProviders - readManifestModelLimits reads MANIFEST_URL, which no test file
 // can resolve.
+// F009: same per-config memoization as resolveProviders above - readManifestModelLimits
+// re-read models.json on every call, and modelLimitsEnv ran twice per session start.
+// An injected map always computes fresh (D5 non-vacuity).
+const modelLimitsCache = new WeakMap<HeadroomConfig, Record<string, string>>();
+
 export function modelLimitsEnv(
   config: HeadroomConfig,
-  manifestLimits: Record<string, number> = readManifestModelLimits(),
+  manifestLimits?: Record<string, number>,
 ): Record<string, string> {
   if (config.modelLimits === false) return {};
-  const limits = { ...manifestLimits, ...(config.modelLimits ?? {}) };
-  if (Object.keys(limits).length === 0) return {};
-  return { HEADROOM_MODEL_LIMITS: JSON.stringify({ context_limits: limits }) };
+  if (manifestLimits === undefined) {
+    const cached = modelLimitsCache.get(config);
+    if (cached) return cached;
+  }
+  const limits = { ...(manifestLimits ?? readManifestModelLimits()), ...(config.modelLimits ?? {}) };
+  const result: Record<string, string> =
+    Object.keys(limits).length === 0 ? {} : { HEADROOM_MODEL_LIMITS: JSON.stringify({ context_limits: limits }) };
+  if (manifestLimits === undefined) modelLimitsCache.set(config, result);
+  return result;
 }
 
 // A CA-bundle path that does not exist is not inert: headroom's Python clients raise
@@ -361,6 +446,14 @@ function proxyEnv(config: HeadroomConfig, shimNeeded: boolean): Record<string, s
     const theirs = env.HEADROOM_ALLOWED_BASE_URLS;
     env.HEADROOM_ALLOWED_BASE_URLS = theirs ? `${theirs},${ours.join(",")}` : ours.join(",");
   }
+  // F028: HEADROOM_NO_CCR=1 - the escape hatch headroom_retrieve's guard comment
+  // already names - existed nowhere in the repo, so the documented contingency was
+  // manual, undocumented in the README, and blind for adopted proxies (which never
+  // see proxyEnv). Wire it behind the noCcr config flag. Off by default: the
+  // trailing-newline mechanism is the working fix (F-V07); this exists for the day
+  // some layer starts trimming trailing whitespace. An explicit extraEnv value still
+  // works - extra spreads above, and this only fires when the flag is set.
+  if (config.noCcr) env.HEADROOM_NO_CCR = "1";
   return env;
 }
 
@@ -446,12 +539,28 @@ export function versionAtLeast(version: string | null, min: readonly [number, nu
   return true;
 }
 
-export function fetchHealth(
+// F014: one generic GET served /health, /stats, and /v1/retrieve/{hash}, but the
+// resolution collapsed the response to healthy = statusCode === 200 - so a 404
+// retrieve (entry expired) and a dead proxy rendered the same "the proxy is not
+// reachable". Return the status code and let callers branch. fetchHealth stays as
+// the thin 200-ness wrapper every health probe keeps using, so the health paths and
+// their tests are untouched.
+export function httpGetStatus(
   origin: string,
   timeoutMs: number,
   path = "/health",
-): Promise<{ healthy: boolean; body: string | null }> {
+  signal?: unknown,
+): Promise<{ status: number | null; body: string | null }> {
   return new Promise((resolve) => {
+    // F027: an already-aborted call never dials. pi passes an AbortSignal to every
+    // tool execute; headroom_retrieve used to discard it, so a cancelled turn still
+    // waited out the full 5 s dial. The signal arrives typed as unknown (the ambient
+    // pi stub declares it so), narrowed to the AbortSignal surface here.
+    const abortSignal = signal as AbortSignal | undefined;
+    if (abortSignal?.aborted) {
+      resolve({ status: null, body: null });
+      return;
+    }
     const req = httpRequest(
       `${origin}${path}`,
       { timeout: timeoutMs },
@@ -466,17 +575,38 @@ export function fetchHealth(
         });
         res.on("end", () => {
           const body = Buffer.concat(chunks).toString("utf-8");
-          resolve({ healthy: res.statusCode === 200, body: body || null });
+          resolve({ status: res.statusCode ?? null, body: body || null });
         });
       },
     );
+    if (abortSignal) {
+      abortSignal.addEventListener(
+        "abort",
+        () => {
+          req.destroy();
+          resolve({ status: null, body: null });
+        },
+        { once: true },
+      );
+    }
     req.on("timeout", () => {
       req.destroy();
-      resolve({ healthy: false, body: null });
+      resolve({ status: null, body: null });
     });
-    req.on("error", () => resolve({ healthy: false, body: null }));
+    req.on("error", () => resolve({ status: null, body: null }));
     req.end();
   });
+}
+
+export function fetchHealth(
+  origin: string,
+  timeoutMs: number,
+  path = "/health",
+): Promise<{ healthy: boolean; body: string | null }> {
+  return httpGetStatus(origin, timeoutMs, path).then(({ status, body }) => ({
+    healthy: status === 200,
+    body,
+  }));
 }
 
 export async function waitForHealthy(origin: string, timeoutMs: number, intervalMs = 250): Promise<boolean> {
@@ -695,7 +825,12 @@ export async function ensureProxyRunning(
   const first = await fetchHealth(origin, 1500);
   if (first.healthy) {
     state.adopted = true;
-    state.version = await headroomVersion(config);
+    // F010: the adopt branch re-spawned `headroom --version` on every session_start
+    // (/new and /resume re-fire the hook) even though the proxy is a machine singleton
+    // whose version cannot have changed underneath it. Reuse the known version; the
+    // spawn branch below keeps its unconditional probe because that one is the
+    // CLI-presence signal feeding the cli-missing diagnostic.
+    if (state.version === null) state.version = await headroomVersion(config);
     return "adopted";
   }
   state.adopted = false;
@@ -1196,7 +1331,16 @@ async function handleHeadroomCommand(
     }
     lines.push(`wired (${state.registered.length}): ${state.registered.length > 0 ? state.registered.join(", ") : "none"}`);
     const { skipped } = resolveProviders(config);
-    if (skipped.length > 0) lines.push(`not wired (disabled): ${skipped.join(", ")}`);
+    if (skipped.length > 0) {
+      // F013: DEFAULT_DISABLED carries a reason per id, but only key membership was
+      // ever read, so the reasons were dead data and status printed bare ids. Show
+      // them; a config-disabled provider (not in DEFAULT_DISABLED) says so.
+      const withReasons = skipped.map((id) => {
+        const reason = DEFAULT_DISABLED[id];
+        return reason ? `${id} (${reason})` : `${id} (disabled in headroom.json)`;
+      });
+      lines.push(`not wired (disabled): ${withReasons.join(", ")}`);
+    }
     const want = rateLimitEnv(config);
     const ml = modelLimitsEnv(config);
     if (ml.HEADROOM_MODEL_LIMITS) {
@@ -1342,17 +1486,31 @@ export default function headroomExtension(pi: ExtensionAPI): void {
         description: "The hash from the marker (the `ccr:` prefix and surrounding text are ignored).",
       }),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      const match = /[a-f0-9]{12,24}/i.exec(params.hash ?? "");
+    async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+      // F048: the old unanchored /[a-f0-9]{12,24}/i took the first 12-24 hex chars of
+      // any longer run - a pasted 40-char SHA silently truncated to 24 and 404'd as
+      // "entry expired", indistinguishable from genuine expiry. The proxy's two real
+      // key forms are 12-hex (Rust mirror) and 24-hex (sha256 alias), so accept
+      // exactly those, delimited so a longer run cannot match (D7). Surrounding text
+      // is still ignored, as the tool's description promises.
+      const match = /(?<![a-f0-9])(?:[a-f0-9]{12}|[a-f0-9]{24})(?![a-f0-9])/i.exec((params.hash ?? "").trim());
       if (!match) {
-        return { content: [{ type: "text", text: `No hash found in "${params.hash}".` }] };
+        return {
+          content: [
+            { type: "text", text: `No 12- or 24-character hash found in "${params.hash}".` },
+          ],
+        };
       }
       const hash = match[0];
       // FR4: validated accessor path — the raw config.port dial bypassed proxyPort's
       // integer/range validation (the lone outlier among the call sites).
       const origin = proxyOrigin(config);
-      const { healthy, body } = await fetchHealth(origin, 5000, `/v1/retrieve/${hash}`);
-      if (!healthy) {
+      // F014+F027: branch on the status code - a 404 means the proxy answered and the
+      // entry is gone, anything else (5xx, or null = transport failure/abort) means
+      // the proxy itself is unreachable - and thread the abort signal so a cancelled
+      // turn does not wait out the 5 s dial.
+      const { status, body } = await httpGetStatus(origin, 5000, `/v1/retrieve/${hash}`, signal);
+      if (status !== 200) {
         let detail = "";
         if (body) {
           try {
@@ -1361,11 +1519,12 @@ export default function headroomExtension(pi: ExtensionAPI): void {
             detail = body;
           }
         }
+        const cause = status === 404 ? "entry expired or unknown hash" : "the proxy is not reachable";
         return {
           content: [
             {
               type: "text",
-              text: `Headroom retrieve failed for ${hash}${detail ? `: ${detail}` : ": the proxy is not reachable."}`,
+              text: `Headroom retrieve failed for ${hash}${detail ? `: ${detail}` : `: ${cause}.`}`,
             },
           ],
         };
