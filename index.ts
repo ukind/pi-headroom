@@ -527,6 +527,30 @@ export async function findPortOwnerPid(
 // POSIX ESRCH -> not-running, EPERM/anything else -> kill-failed. /T kills the whole tree,
 // which is load-bearing on win32: shell:true makes the spawned pid a cmd.exe wrapper with
 // the real proxy as a grandchild.
+// F049: SIGTERM is advisory. A process that installs its own handler keeps the port, and
+// the old fire-and-forget return reported "killed" while the listener survived - the
+// restart path's waitForPortFree then masked it by polling the port, not the PID. Poll
+// process.kill(pid, 0) for the exit, escalate to SIGKILL on expiry, then re-check. The
+// escalation stays inside waitForPortFree's 5 s budget (index.ts:558) so a slow kill
+// cannot starve the port-free probe, and ensureProxyRunning's 1500 ms adopt probe
+// (index.ts:581) still sees a genuinely dead port. A PID that survives SIGKILL plus the
+// grace window is reported kill-failed rather than killed: that is the outcome the old
+// code could not express.
+const KILL_TERM_GRACE_MS = 2000;
+const KILL_KILL_GRACE_MS = 1000;
+const KILL_POLL_MS = 100;
+
+// ESRCH is the only "gone" signal; anything else (EPERM on a process we cannot signal)
+// means it is still there.
+async function pidGone(pid: number): Promise<boolean> {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
 async function killProcess(pid: number): Promise<"killed" | "not-running" | "kill-failed"> {
   if (process.platform === "win32") {
     return new Promise((resolve) => {
@@ -544,10 +568,26 @@ async function killProcess(pid: number): Promise<"killed" | "not-running" | "kil
   }
   try {
     process.kill(pid, "SIGTERM");
-    return "killed";
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === "ESRCH" ? "not-running" : "kill-failed";
   }
+  const termDeadline = Date.now() + KILL_TERM_GRACE_MS;
+  while (!(await pidGone(pid))) {
+    if (Date.now() >= termDeadline) break;
+    await new Promise((r) => setTimeout(r, KILL_POLL_MS));
+  }
+  if (await pidGone(pid)) return "killed";
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH" ? "killed" : "kill-failed";
+  }
+  const killDeadline = Date.now() + KILL_KILL_GRACE_MS;
+  while (!(await pidGone(pid))) {
+    if (Date.now() >= killDeadline) break;
+    await new Promise((r) => setTimeout(r, KILL_POLL_MS));
+  }
+  return (await pidGone(pid)) ? "killed" : "kill-failed";
 }
 
 // The single kill authority. Own live child -> tree-kill via the child handle. Otherwise ->
@@ -604,8 +644,12 @@ export async function ensureProxyRunning(
   config: HeadroomConfig,
   state: HeadroomState,
   onError?: (err: Error) => void,
-): Promise<"adopted" | "spawned" | "unavailable"> {
-  if (isAlive(state)) return "spawned";
+  onProgress?: (msg: string) => void,
+): Promise<"adopted" | "spawned" | "unavailable" | "already-running"> {
+  // F035: isAlive only inspects an in-memory child handle, so it is also true for an
+  // adopted or dying process. Reporting that as "spawned" made the startup banner claim
+  // pi had started something it never touched; a distinct outcome keeps it honest.
+  if (isAlive(state)) return "already-running";
   state.lastSpawnError = null;
   const origin = proxyOrigin(config);
   const first = await fetchHealth(origin, 1500);
@@ -624,6 +668,13 @@ export async function ensureProxyRunning(
     state.lastSpawnError = "cli-missing";
     return "unavailable";
   }
+  // F026: the wait below blocks for the full healthTimeoutMs (20 s default) with no
+  // signal, freezing session startup. Announce it so the block is visible. The default
+  // stays 20 s: lowering it turns a slow cold start into a false "unavailable", which is
+  // the tradeoff TECH_DEBT_AUDIT.md:78 says must be reported rather than hidden.
+  onProgress?.(
+    `[headroom] waiting up to ${config.healthTimeoutMs ?? DEFAULT_CONFIG.healthTimeoutMs} ms for the proxy on ${origin} to become healthy...`,
+  );
   spawnProxy(config, state, defaultUpstreamUrl(config), onError);
   const ok = await waitForHealthy(origin, config.healthTimeoutMs ?? DEFAULT_CONFIG.healthTimeoutMs);
   if (!ok) state.lastSpawnError = "unhealthy";
@@ -634,7 +685,7 @@ export async function restartProxy(
   config: HeadroomConfig,
   state: HeadroomState,
   onError?: (err: Error) => void,
-): Promise<"adopted" | "spawned" | "unavailable"> {
+): Promise<"adopted" | "spawned" | "unavailable" | "already-running"> {
   // FR5: restart kills ANY running instance now — the old skip-wait guard that treated
   // an adopted proxy as untouchable made restart a no-op round-trip. Always wait for the
   // port to free afterwards: a "not-running" from the own-child branch means the wrapper PID is
@@ -845,14 +896,61 @@ export function registerOverrides(
     const header = viaShim
       ? `http://${PROXY_HOST}:${state.shimPort ?? shimPort(config)}/${id}`
       : stripTrailingV1(upstream);
-    pi.registerProvider(id, {
-      baseUrl: proxyBase,
-      headers: { "x-headroom-base-url": header },
-    });
+    // F029: this was the only registration call in the file without a guard, while every
+    // pi.unregisterProvider had one. A throw here (duplicate id, runtime mid-reload)
+    // escaped onSessionStart and killed the whole session-start hook; now the provider is
+    // skipped and reported instead of taking the round down.
+    try {
+      pi.registerProvider(id, {
+        baseUrl: proxyBase,
+        headers: { "x-headroom-base-url": header },
+      });
+    } catch (err) {
+      console.warn(
+        `[headroom] could not wire provider '${id}' (${(err as Error).message}); it stays direct this session`,
+      );
+      continue;
+    }
     wired.push(id);
   }
   state.registered = wired;
   return state.registered;
+}
+
+function unregisterStale(pi: ExtensionAPI, ids: readonly string[], keep: readonly string[]): void {
+  for (const id of ids) {
+    if (keep.includes(id)) continue;
+    try {
+      pi.unregisterProvider(id);
+    } catch {
+      // not registered in this runtime - nothing to undo
+    }
+  }
+}
+
+// F030: a provider disabled in headroom.json while the proxy stays healthy kept its
+// previous-round override, because unregistering only ever ran in the unavailable and
+// !shimOk branches. One diff per round fixes it: whatever was registered last round and
+// is not wired this round goes. Replaces the two ad-hoc unregister loops
+// (index.ts:820-826, index.ts:849-857) and the restart handler's re-wiring.
+export function syncOverrides(
+  pi: ExtensionAPI,
+  config: HeadroomConfig,
+  state: HeadroomState,
+  shimOk = true,
+): string[] {
+  const previous = state.registered;
+  const wired = registerOverrides(pi, config, state, shimOk);
+  unregisterStale(pi, previous, wired);
+  return wired;
+}
+
+// Proxy-down path: nothing is wireable, so the whole previous round goes. Separate from
+// syncOverrides because registerOverrides must not run at all when the proxy is down -
+// it would wire providers onto a base URL nothing is listening on.
+export function clearOverrides(pi: ExtensionAPI, state: HeadroomState): void {
+  unregisterStale(pi, state.registered, []);
+  state.registered = [];
 }
 
 export async function onSessionStart(
@@ -864,6 +962,12 @@ export async function onSessionStart(
   const warn = (msg: string) => {
     if (ctx?.hasUI) ctx.ui.notify(msg, "warning");
     else console.warn(msg);
+  };
+  // F026: the progress channel for the proxy health wait. Same guard shape as warn
+  // (index.ts:800-803) so a headless session logs instead of throwing on ctx.ui.
+  const note = (msg: string) => {
+    if (ctx?.hasUI) ctx.ui.notify(msg, "info");
+    else console.log(msg);
   };
   const envWarning = auditProxyEnv();
   if (envWarning) warn("[headroom] " + envWarning);
@@ -877,18 +981,18 @@ export async function onSessionStart(
   // when the proxy is down, and its "proxy is not reachable" error is the diagnostic.
   pi.setActiveTools([...pi.getActiveTools(), "headroom_retrieve"]);
 
-  const result = await ensureProxyRunning(config, state, (err) =>
-    warn(`[headroom] proxy spawn error: ${err.message}`),
+  const result = await ensureProxyRunning(
+    config,
+    state,
+    (err) => warn(`[headroom] proxy spawn error: ${err.message}`),
+    note,
   );
   if (result === "unavailable") {
-    for (const id of state.registered) {
-      try {
-        pi.unregisterProvider(id);
-      } catch {
-        // not registered in this runtime — nothing to undo
-      }
-    }
-    state.registered = [];
+    // F003: the old loop iterated state.registered after onSessionShutdown had already
+    // emptied it (index.ts:887), so it unregistered nothing while the warning claimed
+    // "stale overrides removed". clearOverrides does the same job against a ledger that
+    // now survives shutdown.
+    clearOverrides(pi, state);
     if (state.lastSpawnError === "cli-missing") {
       state.lastSpawnError = null;
       warn(
@@ -909,15 +1013,11 @@ export async function onSessionStart(
   const { enabled, skipped } = resolveProviders(config);
   const shimIds = enabled.filter((p) => p.viaShim).map((p) => p.id);
   const shimOk = shimIds.length === 0 || (await ensureShimRunning(config, state)) !== "failed";
-  registerOverrides(pi, config, state, shimOk);
+  // F030: the every-round diff. A provider disabled since the last round is not in this
+  // round's wired set, so syncOverrides unregisters it here - the old dedicated !shimOk
+  // loop is gone with it.
+  syncOverrides(pi, config, state, shimOk);
   if (!shimOk) {
-    for (const id of shimIds) {
-      try {
-        pi.unregisterProvider(id); // drop a previous round's shim-header override — never route into a dead shim
-      } catch {
-        // not registered in this runtime — nothing to undo
-      }
-    }
     warn(`[headroom] NOT wired via shim (shim failed to start): ${shimIds.join(", ")} — these stay direct this session`);
   }
 
@@ -929,11 +1029,16 @@ export async function onSessionStart(
         "upstream). Upgrade headroom-ai and restart the session.",
     );
   }
-  const mode = result === "adopted" ? "adopted external proxy" : "proxy spawned";
+  const mode =
+    result === "adopted"
+      ? "adopted external proxy"
+      : result === "already-running"
+        ? "proxy already running"
+        : "proxy spawned";
   const shimNote = shimIds.length > 0 && shimOk ? `, ${shimIds.length} via path shim` : "";
-  const msg = `[headroom] ${mode} on 127.0.0.1:${proxyPort(config)} (v${version}); ${state.registered.length} providers wired${shimNote}`;
-  if (ctx?.hasUI) ctx.ui.notify(msg, "info");
-  else console.log(msg);
+  note(
+    `[headroom] ${mode} on 127.0.0.1:${proxyPort(config)} (v${version}); ${state.registered.length} providers wired${shimNote}`,
+  );
   if (skipped.length > 0) {
     console.log(`[headroom] not wired (disabled in config): ${skipped.join(", ")}`);
   }
@@ -948,12 +1053,17 @@ export async function onSessionStart(
 export function onSessionShutdown(state: HeadroomState): void {
   stopShim(state);
   state.child = null;
-  state.registered = [];
+  // F003: this clear emptied the rollback ledger before the next session_start could
+  // diff it, so a provider disabled while the proxy stayed healthy kept routing through
+  // the proxy across pi's reload() while the warning claimed its override was removed.
+  // syncOverrides' every-round diff is the cleanup authority now; shutdown only drops
+  // the per-session shim and the child handle.
 }
 
 // ---------------------------------------------------------------- commands + factory
 
 async function handleHeadroomCommand(
+  pi: ExtensionAPI,
   args: string,
   ctx: ExtensionCommandContext,
   config: HeadroomConfig,
@@ -1060,12 +1170,34 @@ async function handleHeadroomCommand(
 
   if (sub === "restart") {
     notify("restarting proxy...");
-    const result = await restartProxy(config, state);
+    // F004: re-read headroom.json here. The factory's config snapshot is frozen at load
+    // (index.ts:1011), so the old code respawned with stale limits after an edit and the
+    // status WARNING plus README both half-admitted it in self-contradictory prose.
+    // Scope of the reload (D3): the fresh config reaches the proxy AND the provider wiring
+    // below. It does NOT reach the retrieve tool (index.ts:1060) or /headroom status
+    // (index.ts:907, :939, :961), which keep the factory's frozen port - so after a port edit
+    // this command names the new port while status still prints "proxy: running ... port
+    // <old>" (its liveness comes from the in-memory child handle, index.ts:445, not the
+    // port) and its probes plus headroom_retrieve dial the old port and fail. A full pi
+    // restart remains the only complete re-read; that is the documented tradeoff, not a
+    // defect.
+    const fresh = loadConfig();
+    const result = await restartProxy(fresh, state);
     if (result === "unavailable") {
       notify("proxy failed to come back healthy — /headroom status for detail", "error");
       return;
     }
-    notify(`proxy ${result === "adopted" ? "re-adopted external instance" : "restarted"} on 127.0.0.1:${proxyPort(config)}; ${state.registered.length} providers wired`);
+    // F030 across restarts: the fresh config may enable or disable providers, so re-diff
+    // the wiring instead of reporting the previous round's count. The shim is per-session
+    // and untouched by restartProxy, so its liveness is the shimOk input.
+    syncOverrides(pi, fresh, state, isShimAlive(state));
+    const label =
+      result === "adopted"
+        ? "re-adopted external instance"
+        : result === "already-running"
+          ? "already running"
+          : "restarted";
+    notify(`proxy ${label} on 127.0.0.1:${proxyPort(fresh)}; ${state.registered.length} providers wired`);
     return;
   }
 
@@ -1086,7 +1218,7 @@ export default function headroomExtension(pi: ExtensionAPI): void {
 
   pi.registerCommand("headroom", {
     description: "Headroom proxy: /headroom status|stop|restart",
-    handler: (args: string, ctx: ExtensionCommandContext) => handleHeadroomCommand(args, ctx, config, state),
+    handler: (args: string, ctx: ExtensionCommandContext) => handleHeadroomCommand(pi, args, ctx, config, state),
   });
 
   // CCR redemption: the proxy compresses tool output and leaves a marker
