@@ -7,12 +7,17 @@ import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolvePython } from "../index.ts";
 
 const PROXY_PORT = Number(process.argv[2] ?? 18787);
 const MOCK_PORT = Number(process.argv[3] ?? 18788);
 const PROXY_ORIGIN = `http://127.0.0.1:${PROXY_PORT}`;
-const PYTHON =
-  "C:/Users/utama/AppData/Roaming/uv/tools/headroom-ai/Scripts/python.exe";
+// F006: the pinned absolute python.exe path existed only on the machine that
+// first wrote this file. resolvePython (index.ts) resolves the interpreter the
+// way sanitizedExtraEnv resolves CA bundles: the HEADROOM_PYTHON override is
+// primary, then the uv tool layout probed with existsSync, then a bare
+// interpreter name that must be on PATH.
+const PYTHON = resolvePython();
 
 const HEADER = "Script completed\nWall time 0.1 seconds\nOutput:\n\n";
 const ORIGINALS = {

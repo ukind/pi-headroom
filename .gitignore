@@ -2,20 +2,10 @@
 # Ignore it at any depth so the harness commit stages manifests, not dependencies.
 node_modules/
 
-# >>> APPEND-ONLY: the block above is the whole of this phase's change. The existing
-# >>> `.pi/` block and the four-negation `.rpiv` ladder below it are retained verbatim
-# >>> (Phase 6 collapses the ladder). Do not apply this fence as a full-file replacement.
+# The Python falsification suite (moved to test/ in Slice 6) compiles to
+# test/__pycache__/ on every run - ignore it at any depth.
+__pycache__/
 
 # pi + rpiv local state (never part of the extension)
 .pi/
-# .rpiv is local state, EXCEPT the two phase-1 deliverables of the
-# 2026-10-05 retrieve-recompression plan (the falsification harness),
-# which must be visible to git. Cannot negate below a fully-ignored
-# dir, hence the /* restructure. Everything else stays local.
-.rpiv/*
-!.rpiv/tmp/
-.rpiv/tmp/*
-!.rpiv/tmp/hdrv/
-.rpiv/tmp/hdrv/*
-!.rpiv/tmp/hdrv/test_retrieve_forms.py
-!.rpiv/tmp/hdrv/driver_e2e.mjs
+.rpiv/
