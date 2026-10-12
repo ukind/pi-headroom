@@ -1111,6 +1111,19 @@ export default function headroomExtension(pi: ExtensionAPI): void {
           ],
         };
       }
+      // F043: a 200 with an empty body resolves body = null (fetchHealth maps "" to null,
+      // index.ts:399). JSON.parse(null) coerces null to the string "null" and parses it to
+      // null WITHOUT throwing - the catch below never fires, and parsed.original_content
+      // throws an uncaught TypeError that kills pi. TS2345 (JSON.parse(string | null)) is
+      // the same site. This explicit branch narrows body to string for the try below - no
+      // cast - and answers a usable message instead of crashing the session.
+      if (body === null) {
+        return {
+          content: [
+            { type: "text", text: `Empty response from the proxy for ${hash}.` },
+          ],
+        };
+      }
       let parsed: { original_content?: unknown };
       try {
         parsed = JSON.parse(body) as { original_content?: unknown };
