@@ -1,0 +1,14 @@
+{
+  "name": "headroom-extension",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test \"test/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typebox": "1.3.27",
+    "typescript": "6.0.3"
+  }
+}

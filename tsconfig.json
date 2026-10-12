@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"],
+    // The node --test suite imports ../index.ts with its real extension (Node's
+    // type stripping resolves it at runtime); tsc needs this flag to accept it.
+    "allowImportingTsExtensions": true
+  },
+  "include": ["index.ts", "types", "test/**/*.ts"]
+}

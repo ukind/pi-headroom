@@ -1,3 +1,11 @@
+# Dev-only harness: npm install (Slice 4) creates extensions/headroom/node_modules/.
+# Ignore it at any depth so the harness commit stages manifests, not dependencies.
+node_modules/
+
+# >>> APPEND-ONLY: the block above is the whole of this phase's change. The existing
+# >>> `.pi/` block and the four-negation `.rpiv` ladder below it are retained verbatim
+# >>> (Phase 6 collapses the ladder). Do not apply this fence as a full-file replacement.
+
 # pi + rpiv local state (never part of the extension)
 .pi/
 # .rpiv is local state, EXCEPT the two phase-1 deliverables of the

@@ -8,6 +8,7 @@ import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -136,11 +137,16 @@ export function readManifestProviders(): Record<string, { baseUrl: string; api?:
 
 // Merge order: models.json (upstream truth) < headroom.json (flags + overrides).
 // Only openai-completions providers are wireable (Headroom speaks the OpenAI path shape).
-export function resolveProviders(config: HeadroomConfig): {
+// The optional manifest parameter is the DI seam (D5): tests inject a manifest
+// instead of reading the machine's live models.json, so the suite is hermetic and
+// cannot pass or fail on whichever providers happen to be installed here.
+export function resolveProviders(
+  config: HeadroomConfig,
+  manifest: Record<string, { baseUrl: string; api?: string }> = readManifestProviders(),
+): {
   enabled: ResolvedProvider[];
   skipped: string[];
 } {
-  const manifest = readManifestProviders();
   const enabled: ResolvedProvider[] = [];
   const skipped: string[] = [];
   const entries = config.providers ?? {};
@@ -279,9 +285,15 @@ export function readManifestModelLimits(): Record<string, number> {
   }
 }
 
-export function modelLimitsEnv(config: HeadroomConfig): Record<string, string> {
+// The optional manifestLimits parameter is the DI seam (D5): same hidden-fs dependency
+// as resolveProviders - readManifestModelLimits reads MANIFEST_URL, which no test file
+// can resolve.
+export function modelLimitsEnv(
+  config: HeadroomConfig,
+  manifestLimits: Record<string, number> = readManifestModelLimits(),
+): Record<string, string> {
   if (config.modelLimits === false) return {};
-  const limits = { ...readManifestModelLimits(), ...(config.modelLimits ?? {}) };
+  const limits = { ...manifestLimits, ...(config.modelLimits ?? {}) };
   if (Object.keys(limits).length === 0) return {};
   return { HEADROOM_MODEL_LIMITS: JSON.stringify({ context_limits: limits }) };
 }
@@ -343,6 +355,24 @@ function proxyEnv(config: HeadroomConfig, shimNeeded: boolean): Record<string, s
 function defaultUpstreamUrl(config: HeadroomConfig): string {
   const { enabled } = resolveProviders(config);
   return enabled[0]?.upstream ?? `https://${PROXY_HOST}/v1`;
+}
+
+// F006: the e2e driver pinned an absolute python.exe path that exists only on the
+// machine that wrote it (.rpiv/tmp/hdrv/driver_e2e.mjs:14-15). Resolve the
+// interpreter the way sanitizedExtraEnv (index.ts:298-308) resolves CA bundles:
+// the explicit HEADROOM_PYTHON override is primary (the driver needs an interpreter
+// to run `python -c`, not just the CLI binary), then the uv tool layout probed with
+// existsSync so a dead path is dropped rather than spawned into ENOENT, then a bare
+// interpreter name that must be on PATH.
+export function resolvePython(): string {
+  const fromEnv = process.env.HEADROOM_PYTHON;
+  if (fromEnv) return fromEnv;
+  const uvLayout =
+    process.platform === "win32"
+      ? join(process.env.APPDATA ?? homedir(), "uv/tools/headroom-ai/Scripts/python.exe")
+      : join(homedir(), ".local/share/uv/tools/headroom-ai/bin/python");
+  if (existsSync(uvLayout)) return uvLayout;
+  return process.platform === "win32" ? "python" : "python3";
 }
 
 export async function headroomVersion(config: HeadroomConfig): Promise<string | null> {
