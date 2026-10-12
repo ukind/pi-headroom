@@ -739,9 +739,13 @@ export async function findPortOwnerPid(
   if (failed) return "lookup-failed";
   const pid = Number.parseInt(out.trim(), 10);
   if (Number.isInteger(pid) && pid > 0) return pid;
-  // Windows: -ErrorAction SilentlyContinue makes a no-match exit 0 with empty stdout.
-  // POSIX: lsof exits 1 when nothing is found. Both mean "no listener", not failure.
-  if (code === 0 || (!win32 && code === 1)) return null;
+  // Windows: a no-match Get-NetTCPConnection exits 1 with EMPTY stdout on this
+  // machine's PowerShell (measured 2026-10-12: {"out":"","code":1,"failed":false}) -
+  // -ErrorAction SilentlyContinue silences the error record but leaves the engine's
+  // error state, which powershell.exe reports as exit 1. Empty stdout with exit 0 or 1
+  // means "no listener", not failure; any other exit code stays lookup-failed. POSIX:
+  // lsof exits 1 when nothing is found. Both mean "no listener", not failure.
+  if (code === 0 || (!win32 && code === 1) || (win32 && code === 1 && out.trim() === "")) return null;
   return "lookup-failed";
 }
 
