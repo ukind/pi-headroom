@@ -650,7 +650,17 @@ export function createShimHandler(
   config: HeadroomConfig,
 ): (req: IncomingMessage, res: ServerResponse) => void {
   return (req, res) => {
-    const url = new URL(req.url ?? "/", `http://${PROXY_HOST}`);
+    // F031: the request-target parse sat outside any guard - a malformed target threw an
+    // uncaught TypeError and killed pi. Guarded here with a 400; the upstream-target parse
+    // below keeps its own 502 guard.
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "/", `http://${PROXY_HOST}`);
+    } catch {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "headroom-shim: malformed request target" } }));
+      return;
+    }
     const [id, ...restSegments] = url.pathname.replace(/^\//, "").split("/");
     const upstream = id ? providers[id] : undefined;
     if (!upstream) {
@@ -682,8 +692,13 @@ export function createShimHandler(
     outReq.on("error", (err) => {
       if (!res.headersSent) {
         res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: `headroom-shim: upstream error: ${err.message}` } }));
+      } else {
+        // F008: res.end after headersSent (and after writableEnded) emits "error" on res,
+        // which has no listener - the error handler itself crashed the process. Destroy
+        // instead; composes with the res.on("close") abort propagation below.
+        res.destroy();
       }
-      res.end(JSON.stringify({ error: { message: `headroom-shim: upstream error: ${err.message}` } }));
     });
     // Abort propagation: if the client disconnects before the response finishes, kill the
     // upstream request. (req "close" fires as soon as the body is consumed — watching the
@@ -697,6 +712,10 @@ export function createShimHandler(
       delete outHeaders["keep-alive"];
       delete outHeaders["transfer-encoding"];
       res.writeHead(upRes.statusCode ?? 502, outHeaders);
+      // F002: once "response" fires, mid-stream socket errors are delivered to the response
+      // stream, not re-emitted on the request - outReq.on("error") does not cover them. An
+      // unhandled upRes "error" is an uncaught exception that kills pi (the Critical).
+      upRes.on("error", () => res.destroy());
       upRes.pipe(res);
     });
     req.pipe(outReq);
@@ -711,6 +730,21 @@ export function startShim(
   const providers: Record<string, string> = {};
   for (const p of resolveProviders(config).enabled) providers[p.id] = p.upstream;
   const server = createServer(createShimHandler(providers, config));
+  // F001: after the bind probe removes its one-shot "error" listener on successful bind,
+  // a bound Server with zero "error" listeners turns any post-bind server-level error
+  // into an uncaught exception that kills pi. This permanent handler keeps a listener
+  // attached for the server's lifetime. It must stay log-only: the bind-probe retry in
+  // ensureShimRunning depends on its own onErr resolving false, on stopShim clearing
+  // state.shim, and on the 250 ms backoff - none of which this handler disturbs
+  // (verified against index.ts:733-762). EADDRINUSE is skipped: it can only fire during
+  // a listen attempt, which the bind probe owns and reports.
+  // (The err shape is spelled out structurally rather than as NodeJS.ErrnoException: the
+  // ambient @types/node is not installed until the Phase-4 harness, and referencing the
+  // NodeJS namespace here would add one TS2503 to the F-V10 baseline this slice must hold.)
+  server.on("error", (err: Error & { code?: string }) => {
+    if (err.code === "EADDRINUSE") return;
+    console.warn(`[headroom] shim server error on 127.0.0.1:${port} (${err.code ?? err.message})`);
+  });
   state.shim = server;
   state.shimPort = port;
   return server;
