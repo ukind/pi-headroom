@@ -174,8 +174,15 @@ export function auditProxyEnv(): string | null {
     process.env.https_proxy;
   if (!proxy) return null;
   const noProxy = (process.env.NO_PROXY ?? process.env.no_proxy ?? "").toLowerCase();
+  // F024: split on commas and compare trimmed entries exactly. The old substring test
+  // (noProxy.includes("127.0.0.1") && noProxy.includes("localhost")) matched inside
+  // longer entries: NO_PROXY=my-localhost-cache.internal passed the localhost test and
+  // 127.0.0.1.evil.invalid passed the loopback test, so a proxy that did NOT cover
+  // loopback looked covered and Headroom's traffic tunneled through the ambient proxy.
+  // Exact entries only; "*" still short-circuits.
+  const entries = noProxy.split(",").map((entry) => entry.trim()).filter(Boolean);
   const coversLoopback =
-    noProxy.includes("*") || (noProxy.includes("127.0.0.1") && noProxy.includes("localhost"));
+    entries.includes("*") || (entries.includes("127.0.0.1") && entries.includes("localhost"));
   if (coversLoopback) return null;
   return (
     `HTTP_PROXY/HTTPS_PROXY is set (${proxy}) but NO_PROXY does not cover 127.0.0.1,localhost. ` +
@@ -319,8 +326,13 @@ export function sanitizedExtraEnv(config: HeadroomConfig): Record<string, string
   return extra;
 }
 
+// F023: the guard checked only SSL_CERT_FILE, so a user who set REQUESTS_CA_BUNDLE (or
+// CURL_CA_BUNDLE) to a valid custom bundle and left SSL_CERT_FILE unset got all three
+// keys overwritten with DEFAULT_CA_BUNDLE - their custom bundle silently replaced by
+// the auto-detected one. Guard on any of the three CA_KEYS: if the user configured any
+// CA path, respect it; auto-inject only when none is set.
 export function caBundleEnv(extra: Record<string, string>): Record<string, string> {
-  if (extra.SSL_CERT_FILE || !existsSync(DEFAULT_CA_BUNDLE)) return {};
+  if (CA_KEYS.some((key) => extra[key]) || !existsSync(DEFAULT_CA_BUNDLE)) return {};
   return { SSL_CERT_FILE: DEFAULT_CA_BUNDLE, REQUESTS_CA_BUNDLE: DEFAULT_CA_BUNDLE, CURL_CA_BUNDLE: DEFAULT_CA_BUNDLE };
 }
 
@@ -352,9 +364,37 @@ function proxyEnv(config: HeadroomConfig, shimNeeded: boolean): Record<string, s
   return env;
 }
 
+// F025: this value reaches spawn(..., { shell: true }) as the --openai-api-url argument
+// (spawnProxy, index.ts:433-435). Node does not quote arguments for cmd.exe, so a
+// models.json baseUrl containing shell metacharacters would reach the shell - the
+// manifest is third-party data any tool install can write. Validate before the spawn:
+// parse with new URL(), accept only http:/https:, and reject the metacharacters that
+// survive URL parsing (& and | pass through raw; " ^ < > are percent-encoded by the
+// parser but the raw string is what would reach the shell, so they are rejected too).
+// An unusable upstream falls back to the same safe default the no-providers case uses
+// and warns - the proxy still starts, and provider traffic (which carries its own
+// x-headroom-base-url header) is unaffected. shell:true itself stays: F-V02 - it is
+// what makes a missing CLI exit non-zero instead of raising ENOENT, powering the
+// CLI-absent fast-fail. This validation is additive to the spawn, never a change to
+// the flag.
 function defaultUpstreamUrl(config: HeadroomConfig): string {
   const { enabled } = resolveProviders(config);
-  return enabled[0]?.upstream ?? `https://${PROXY_HOST}/v1`;
+  const candidate = enabled[0]?.upstream;
+  if (candidate) {
+    try {
+      const protocol = new URL(candidate).protocol;
+      if ((protocol === "http:" || protocol === "https:") && !/[&|<>^"\s]/.test(candidate)) {
+        return candidate;
+      }
+    } catch {
+      // not a parseable URL - fall through to the safe default
+    }
+    console.warn(
+      `[headroom] ignoring unusable default upstream '${candidate}' (not a clean http(s) URL); ` +
+        "the proxy starts with its built-in default upstream instead",
+    );
+  }
+  return `https://${PROXY_HOST}/v1`;
 }
 
 // F006: the e2e driver pinned an absolute python.exe path that exists only on the
@@ -714,10 +754,15 @@ function isShimAlive(state: HeadroomState): boolean {
 }
 
 // CA bundle for outbound TLS (corporate-intercepted machines): reuse the bundle already
-// provisioned for the Headroom proxy via extraEnv.SSL_CERT_FILE. Missing file -> Node's
-// default store.
+// provisioned for the Headroom proxy via extraEnv. F022: consume sanitizedExtraEnv's
+// output instead of reading config.extraEnv raw - a CA path that does not exist is not
+// inert (headroom's Python clients raise on every upstream call), and the sanitizer
+// drops dead paths with a warning; the old raw read bypassed that, so the shim and the
+// proxy treated the same configured value differently. Called once per shim start now
+// (F044), so the sanitizer's warning fires once, not per request. Missing file ->
+// Node's default store.
 function shimCaBundle(config: HeadroomConfig): string[] | undefined {
-  const file = config.extraEnv?.SSL_CERT_FILE ?? process.env.SSL_CERT_FILE;
+  const file = sanitizedExtraEnv(config).SSL_CERT_FILE ?? process.env.SSL_CERT_FILE;
   if (!file) return undefined;
   try {
     return [readFileSync(file, "utf-8")];
@@ -726,10 +771,43 @@ function shimCaBundle(config: HeadroomConfig): string[] | undefined {
   }
 }
 
+// F032: the shim is an unauthenticated loopback relay, and that is a documented trust
+// assumption rather than an oversight. It binds 127.0.0.1 only, so no off-machine
+// process can reach it; every request on that port is trusted as pi's own, which is
+// why there is no auth token - there is no reachable attacker to authenticate against.
+// Path segments are confined to the mapped origin by the new URL construction below,
+// so it is not an open proxy. What was missing is a bound on the request body: any
+// local process could stream unbounded data through the shim to a mapped upstream.
+// SHIM_MAX_BODY_BYTES is that bound - it sits far above observed pi traffic (inbound
+// bodies up to ~494KB, measured 2026-09-27), so no legitimate turn can trip it. A
+// chunked upload declares no content-length and is not bounded by this check; pi's
+// client always sends content-length for its JSON bodies, and a local process bent on
+// flooding an upstream can dial it directly without the shim.
+const SHIM_MAX_BODY_BYTES = 10 * 1024 * 1024;
+// F007: the shim's outbound requests were the only network dials in the file without a
+// timeout - a hung upstream held a socket, a request object, and the buffered body
+// indefinitely, while every other dial goes through fetchHealth's timeout discipline.
+// This is a socket-idle timeout: once the response streams, each chunk resets it, so
+// it bounds hangs, not slow streams. The destroy routes into the existing outReq
+// "error" handler below (verified: destroy() emits ECONNRESET on the request), which
+// answers 502 before headers and destroys the response after. Single knob - tune here.
+const SHIM_TIMEOUT_MS = 120_000;
+
 export function createShimHandler(
   providers: Record<string, string>,
   config: HeadroomConfig,
 ): (req: IncomingMessage, res: ServerResponse) => void {
+  // F044+F022: shimCaBundle did a synchronous readFileSync of the root CA bundle inside
+  // the per-request send closure - every shim-routed token (all zai-paas traffic) paid
+  // a blocking disk read of a several-hundred-KB PEM on the request path. Read once
+  // here instead: createShimHandler runs once per shim start (startShim's createServer
+  // call), so the closure below sees a stable value for the server's lifetime.
+  // F022 is why this cannot land alone: the old read took config.extraEnv?.SSL_CERT_FILE
+  // raw, bypassing sanitizedExtraEnv's dead-path drop - hoisting that read unchanged
+  // would have cached a dead path as a permanently broken value. shimCaBundle now
+  // consumes the sanitized map, so a dead path is dropped (with the sanitizer's
+  // warning) before the read.
+  const caBundle = shimCaBundle(config);
   return (req, res) => {
     // F031: the request-target parse sat outside any guard - a malformed target threw an
     // uncaught TypeError and killed pi. Guarded here with a 400; the upstream-target parse
@@ -740,6 +818,14 @@ export function createShimHandler(
     } catch {
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: "headroom-shim: malformed request target" } }));
+      return;
+    }
+    // F032: bound the request body at the door - a declared content-length over the cap
+    // is rejected before any upstream work happens.
+    const declaredLength = Number(req.headers["content-length"]);
+    if (Number.isFinite(declaredLength) && declaredLength > SHIM_MAX_BODY_BYTES) {
+      res.writeHead(413, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "headroom-shim: request body too large" } }));
       return;
     }
     const [id, ...restSegments] = url.pathname.replace(/^\//, "").split("/");
@@ -767,9 +853,12 @@ export function createShimHandler(
     }
     const send = (isHttps: boolean) =>
       isHttps
-        ? httpsRequest(target, { method: req.method, headers, ca: shimCaBundle(config) })
-        : httpRequest(target, { method: req.method, headers });
+        ? httpsRequest(target, { method: req.method, headers, ca: caBundle, timeout: SHIM_TIMEOUT_MS })
+        : httpRequest(target, { method: req.method, headers, timeout: SHIM_TIMEOUT_MS });
     const outReq = send(target.protocol === "https:");
+    // F007: idle-socket timeout -> destroy, which emits 'error' on outReq and routes
+    // into the handler below.
+    outReq.on("timeout", () => outReq.destroy());
     outReq.on("error", (err) => {
       if (!res.headersSent) {
         res.writeHead(502, { "content-type": "application/json" });
@@ -782,7 +871,7 @@ export function createShimHandler(
       }
     });
     // Abort propagation: if the client disconnects before the response finishes, kill the
-    // upstream request. (req "close" fires as soon as the body is consumed — watching the
+    // upstream request. (req "close" fires as soon as the body is consumed - watching the
     // response socket is the reliable signal.)
     res.on("close", () => {
       if (!res.writableEnded) outReq.destroy();
