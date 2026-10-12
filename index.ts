@@ -99,6 +99,21 @@ export function stripTrailingV1(upstream: string): string {
   return upstream.replace(/\/v1\/?$/, "");
 }
 
+// F037: every diagnostic used to go to console or a transient ui.notify, so after a bad
+// session start the reason was gone once the notification cleared. This bounded ring
+// keeps the last N messages in memory for /headroom status to print. Module-level on
+// purpose: the factory re-runs on every pi reload but the module evaluates once per
+// process, so the ring survives reloads exactly like the process-wide singleton state
+// does. It is deliberately NOT a HeadroomState field — the locked unit suite pins
+// createState()'s exact shape (test/index.test.ts, "createState: fresh state is empty").
+const DIAGNOSTIC_RING_LIMIT = 20;
+const diagnosticRing: string[] = [];
+
+function recordDiagnostic(msg: string): void {
+  diagnosticRing.push(msg);
+  if (diagnosticRing.length > DIAGNOSTIC_RING_LIMIT) diagnosticRing.shift();
+}
+
 // ---------------------------------------------------------------- config layer
 
 // F011: the known top-level keys of headroom.json. With HeadroomConfig's index
@@ -130,7 +145,10 @@ export function loadConfig(): HeadroomConfig {
     }
     for (const key of Object.keys(parsed)) {
       if (!CONFIG_KEYS.has(key)) {
-        console.warn(`[headroom] ignoring unknown headroom.json key '${key}'`);
+        // F037: ring the warning so /headroom status can show it after the fact.
+        const msg = `[headroom] ignoring unknown headroom.json key '${key}'`;
+        console.warn(msg);
+        recordDiagnostic(msg);
       }
     }
     return parsed;
@@ -138,7 +156,9 @@ export function loadConfig(): HeadroomConfig {
     const code = (err as NodeJS.ErrnoException).code;
     const reason = err instanceof Error ? err.message : String(err);
     if (code !== "ENOENT") {
-      console.warn(`[headroom] ignoring broken headroom.json (${reason}); using built-in defaults`);
+      const msg = `[headroom] ignoring broken headroom.json (${reason}); using built-in defaults`;
+      console.warn(msg);
+      recordDiagnostic(msg);
     }
     return {};
   }
@@ -160,11 +180,13 @@ export function readManifestProviders(): Record<string, { baseUrl: string; api?:
     return out;
   } catch (err) {
     // Silent is the worst outcome here: zero providers wired looks like a working extension.
-    console.warn(
+    const msg =
       `[headroom] cannot read the provider manifest at ${MANIFEST_URL} ` +
-        `(${(err as Error).message}) — wiring ZERO providers. This path assumes the folder sits ` +
-        `at <agent-dir>/extensions/headroom/.`,
-    );
+      `(${(err as Error).message}) — wiring ZERO providers. This path assumes the folder sits ` +
+      `at <agent-dir>/extensions/headroom/.`;
+    console.warn(msg);
+    // F037: this is THE session-start failure worth surviving the notification.
+    recordDiagnostic(msg);
     return {};
   }
 }
@@ -358,10 +380,11 @@ export function readManifestModelLimits(): Record<string, number> {
     }
     return out;
   } catch (err) {
-    console.warn(
+    const msg =
       `[headroom] cannot read model limits from ${MANIFEST_URL} (${(err as Error).message}); ` +
-        "headroom falls back to its 128,000-token default per unknown model",
-    );
+      "headroom falls back to its 128,000-token default per unknown model";
+    console.warn(msg);
+    recordDiagnostic(msg);
     return {};
   }
 }
@@ -528,6 +551,11 @@ export async function headroomVersion(config: HeadroomConfig): Promise<string | 
   });
 }
 
+// F033: null is a real outcome — "cannot confirm" (absent or unparseable version) —
+// and it is NOT false. Callers must warn on null too; the locked unit suite pins this
+// boolean | null shape (test/index.test.ts, "versionAtLeast: null for absent or
+// unparseable versions"), so the fix lands at the call sites: the gate in
+// onSessionStart and the annotation in renderStatus.
 export function versionAtLeast(version: string | null, min: readonly [number, number, number]): boolean | null {
   if (!version) return null;
   const parts = version.split(".").map((n) => Number.parseInt(n, 10));
@@ -630,17 +658,37 @@ export function spawnProxy(
   onError?: (err: Error) => void,
 ): ChildProcess {
   const args = ["proxy", "--port", String(proxyPort(config)), "--openai-api-url", defaultUpstream];
+  // F046: stdio was "ignore", so a pi-spawned proxy's stdout and stderr were discarded —
+  // a proxy that crashes on boot (bad env, missing Python dep, port race) left no trace
+  // and the only signal was the 20 s health timeout. Pipe stderr and keep the first
+  // line: on a non-zero exit it lands in state.lastSpawnError, which F045 renders in
+  // the unavailable warning and /headroom status. stdout stays ignored — the proxy's
+  // banner is noise on this path.
   const child = spawn(config.command ?? DEFAULT_CONFIG.command, args, {
     shell: process.platform === "win32",
     env: { ...process.env, ...proxyEnv(config, needsShim(config)) },
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe"],
     windowsHide: true,
   });
+  let stderr = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    // Bounded: a proxy spamming stderr must not grow this buffer for the whole wait.
+    if (stderr.length < 4096) stderr += chunk.toString();
+  });
   child.on("error", (err) => {
+    // A spawn failure after a successful version probe (POSIX ENOENT race) is the same
+    // class of missing trace — record it where the health-wait failure will look.
+    state.lastSpawnError = err.message;
     if (onError) onError(err);
   });
-  child.on("close", () => {
+  child.on("close", (code) => {
     if (state.child === child) state.child = null;
+    // F046: the first stderr line, trimmed and bounded — the only trace of a boot crash.
+    // Split on \r?\n so a win32 proxy's CRLF does not leave a stray carriage return in
+    // the rendered reason.
+    if (code !== 0 && stderr.trim()) {
+      state.lastSpawnError = stderr.trim().split(/\r?\n/)[0]!.slice(0, 200);
+    }
   });
   state.child = child;
   return child;
@@ -852,7 +900,10 @@ export async function ensureProxyRunning(
   );
   spawnProxy(config, state, defaultUpstreamUrl(config), onError);
   const ok = await waitForHealthy(origin, config.healthTimeoutMs ?? DEFAULT_CONFIG.healthTimeoutMs);
-  if (!ok) state.lastSpawnError = "unhealthy";
+  // F046: spawnProxy's close handler may already have captured the proxy's first
+  // stderr line into lastSpawnError. That line is strictly more informative than the
+  // "unhealthy" sentinel, so only fall back to the sentinel when nothing was captured.
+  if (!ok && state.lastSpawnError === null) state.lastSpawnError = "unhealthy";
   return ok ? "spawned" : "unavailable";
 }
 
@@ -1184,12 +1235,18 @@ export async function onSessionStart(
   ctx?: ExtensionContext,
 ): Promise<void> {
   const warn = (msg: string) => {
+    // F037: this channel's messages land in the ring /headroom status prints. The
+    // manifest/config readers ring their own warnings directly; the spawn-time
+    // env-assembly warnings (resolveProviders, sanitizedExtraEnv, ensureShimRunning,
+    // registerOverrides, startShim) stay console-only by scope.
+    recordDiagnostic(msg);
     if (ctx?.hasUI) ctx.ui.notify(msg, "warning");
     else console.warn(msg);
   };
   // F026: the progress channel for the proxy health wait. Same guard shape as warn
   // (index.ts:800-803) so a headless session logs instead of throwing on ctx.ui.
   const note = (msg: string) => {
+    recordDiagnostic(msg);
     if (ctx?.hasUI) ctx.ui.notify(msg, "info");
     else console.log(msg);
   };
@@ -1226,8 +1283,12 @@ export async function onSessionStart(
       );
       return;
     }
+    // F045: name the reason — "unhealthy" (spawned, never healthy) or the captured first
+    // stderr line (F046) — instead of the same generic line a never-started proxy gets.
+    const reason = spawnErrorReason(state.lastSpawnError);
     warn(
-      `[headroom] proxy unavailable after ${config.healthTimeoutMs ?? DEFAULT_CONFIG.healthTimeoutMs} ms — ` +
+      `[headroom] proxy unavailable after ${config.healthTimeoutMs ?? DEFAULT_CONFIG.healthTimeoutMs} ms` +
+        `${reason ? ` (${reason})` : ""} — ` +
         'stale overrides removed, providers left DIRECT. Install with: uv tool install "headroom-ai[proxy]", ' +
         "or check the port in headroom.json.",
     );
@@ -1246,11 +1307,19 @@ export async function onSessionStart(
   }
 
   const version = state.version ?? "unknown";
-  if (versionAtLeast(version, MIN_VERSION) === false) {
+  // F033: the gate tested === false, so an unparseable version (null) silently skipped
+  // the warning — the exact blind spot the audit names. Warn on null too.
+  const gate = versionAtLeast(version, MIN_VERSION);
+  if (gate === false) {
     warn(
       `[headroom] headroom-ai ${version} < ${MIN_VERSION.join(".")}: this build may ignore ` +
         "x-headroom-base-url on the chat-completions path (traffic would all land on the default " +
         "upstream). Upgrade headroom-ai and restart the session.",
+    );
+  } else if (gate === null) {
+    warn(
+      `[headroom] cannot parse the headroom-ai version '${version}'; cannot confirm ` +
+        `x-headroom-base-url support (needs >= ${MIN_VERSION.join(".")}).`,
     );
   }
   const mode =
@@ -1264,7 +1333,9 @@ export async function onSessionStart(
     `[headroom] ${mode} on 127.0.0.1:${proxyPort(config)} (v${version}); ${state.registered.length} providers wired${shimNote}`,
   );
   if (skipped.length > 0) {
-    console.log(`[headroom] not wired (disabled in config): ${skipped.join(", ")}`);
+    // F036: this line always used console.log, so a UI user never saw which providers
+    // were left unwired. Route it through the same guarded helper as the banner.
+    note(`[headroom] not wired (disabled in config): ${skipped.join(", ")}`);
   }
 }
 
@@ -1286,6 +1357,184 @@ export function onSessionShutdown(state: HeadroomState): void {
 
 // ---------------------------------------------------------------- commands + factory
 
+// F045: prose for the lastSpawnError sentinels and the F046-captured stderr line,
+// shared by the unavailable warning in onSessionStart, restartHandler, and renderStatus.
+// Function declaration (hoisted) so onSessionStart can call it from above — the same
+// pattern spawnProxy already uses with needsShim.
+function spawnErrorReason(err: string | null): string | null {
+  if (err === null) return null;
+  if (err === "unhealthy") return "the proxy process spawned but never became healthy";
+  if (err === "cli-missing") return "the headroom CLI is missing or cannot run";
+  return `proxy stderr: ${err}`;
+}
+
+// F017: extracted from handleHeadroomCommand's ~70-line status branch. Rendering plus
+// two loopback probes — no notify, no ctx: the caller decides how to show the returned
+// string. The /stats and /health probes used to run sequentially (2 s each, up to 4 s of
+// blocking inside a UI command handler); they now run together, fired before the
+// synchronous line-building so they overlap it. Output line order is unchanged.
+export async function renderStatus(config: HeadroomConfig, state: HeadroomState): Promise<string> {
+  const origin = proxyOrigin(config);
+  const [statsProbe, healthProbe] = await Promise.all([
+    fetchHealth(origin, 2000, "/stats"),
+    fetchHealth(origin, 2000),
+  ]);
+  const lines: string[] = [];
+  if (state.adopted) {
+    lines.push(`proxy: external instance on 127.0.0.1:${proxyPort(config)} (not spawned by pi; /headroom stop WILL kill it via the port-owner PID)`);
+  } else if (isAlive(state)) {
+    lines.push(`proxy: running (pid ${state.child?.pid}, port ${proxyPort(config)})`);
+  } else {
+    lines.push("proxy: DOWN — wired providers will error until /headroom restart");
+  }
+  if (state.version) {
+    const gate = versionAtLeast(state.version, MIN_VERSION);
+    // F033: null (unparseable) used to render bare, indistinguishable from a good
+    // version. Say so.
+    const gateNote =
+      gate === false
+        ? ` (below ${MIN_VERSION.join(".")}: chat-completions header support uncertain)`
+        : gate === null
+          ? ` (unparseable: cannot confirm ${MIN_VERSION.join(".")}+ header support)`
+          : "";
+    lines.push(`version: ${state.version}${gateNote}`);
+  } else {
+    lines.push("version: unknown");
+  }
+  const { enabled } = resolveProviders(config);
+  const shimIds = enabled.filter((p) => p.viaShim).map((p) => p.id);
+  if (shimIds.length > 0) {
+    if (isShimAlive(state)) {
+      lines.push(`shim: 127.0.0.1:${state.shimPort ?? shimPort(config)} (rewrites /v1/* to native paths) — ${shimIds.join(", ")}`);
+    } else {
+      lines.push(`shim: DOWN — ${shimIds.join(", ")} cannot route; /headroom restart or fix port ${shimPort(config)}`);
+    }
+  }
+  lines.push(`wired (${state.registered.length}): ${state.registered.length > 0 ? state.registered.join(", ") : "none"}`);
+  const { skipped } = resolveProviders(config);
+  if (skipped.length > 0) {
+    // F013: DEFAULT_DISABLED carries a reason per id, but only key membership was
+    // ever read, so the reasons were dead data and status printed bare ids. Show
+    // them; a config-disabled provider (not in DEFAULT_DISABLED) says so.
+    const withReasons = skipped.map((id) => {
+      const reason = DEFAULT_DISABLED[id];
+      return reason ? `${id} (${reason})` : `${id} (disabled in headroom.json)`;
+    });
+    lines.push(`not wired (disabled): ${withReasons.join(", ")}`);
+  }
+  // F045: lastSpawnError was written and never read — a proxy that spawned but never
+  // became healthy rendered exactly like one that never started. Show it.
+  const spawnReason = spawnErrorReason(state.lastSpawnError);
+  if (spawnReason) lines.push(`last spawn error: ${spawnReason}`);
+  const want = rateLimitEnv(config);
+  const ml = modelLimitsEnv(config);
+  if (ml.HEADROOM_MODEL_LIMITS) {
+    try {
+      const n = Object.keys(JSON.parse(ml.HEADROOM_MODEL_LIMITS).context_limits as Record<string, number>).length;
+      lines.push(`model limits: ${n} models from models.json (headroom default is 128,000)`);
+    } catch {
+      // unreachable: modelLimitsEnv only emits valid JSON
+    }
+  }
+  if (statsProbe.healthy && statsProbe.body) {
+    try {
+      const rl = (JSON.parse(statsProbe.body) as {
+        rate_limiter?: { requests_per_minute?: number; tokens_per_minute?: number };
+      }).rate_limiter;
+      const tpm = rl?.tokens_per_minute;
+      if (typeof tpm === "number") {
+        lines.push(`rate limit: ${rl?.requests_per_minute} rpm / ${tpm} tpm (below these headroom 429s on its own)`);
+        const wantTpm = want.HEADROOM_TPM ? Number(want.HEADROOM_TPM) : null;
+        if (wantTpm && tpm < wantTpm) {
+          lines.push(
+            `WARNING: live proxy tpm=${tpm} < configured ${wantTpm}, so this proxy predates the config. ` +
+              "Fix: /headroom restart — it now kills any running instance (including adopted ones) " +
+              "and respawns with the current config (headroom.json is read once at load, so edit it first).",
+          );
+        }
+      }
+    } catch {
+      // /stats not JSON -> skip the rate-limit line
+    }
+  }
+  if (healthProbe.healthy && healthProbe.body) {
+    try {
+      const stats = JSON.parse(healthProbe.body) as { stats?: { total_requests?: number; tokens_saved?: number } };
+      if (stats.stats) {
+        lines.push(`stats: ${stats.stats.total_requests ?? 0} requests, ${stats.stats.tokens_saved ?? 0} tokens saved`);
+      }
+    } catch {
+      // body not JSON — skip the stats line
+    }
+  }
+  // F037: the ring — the session-start diagnostics that used to vanish with the
+  // notification. Newest last.
+  if (diagnosticRing.length > 0) {
+    lines.push(`recent diagnostics (last ${diagnosticRing.length}):`);
+    for (const entry of diagnosticRing) lines.push(`  ${entry}`);
+  }
+  return lines.join("\n");
+}
+
+// F017: the stop branch, extracted. notify is the guarded helper from
+// handleHeadroomCommand (F047) so a headless dispatch still reaches the console.
+async function stopHandler(
+  config: HeadroomConfig,
+  state: HeadroomState,
+  notify: (msg: string, level?: "info" | "warning" | "error") => void,
+): Promise<void> {
+  const result = await stopProxy(config, state);
+  if (result === "stopped")
+    notify("proxy stopped (pi-spawned instance); providers still wired — turns will error until /headroom restart");
+  else if (result === "stopped-external")
+    notify("proxy stopped (external instance killed via port-owner PID); providers still wired — turns will error until /headroom restart");
+  else if (result === "not-running") notify("proxy not running", "warning");
+  else if (result === "lookup-failed")
+    notify(`proxy not stopped — the port-owner lookup failed on port ${proxyPort(config)} (is Get-NetTCPConnection/lsof available?)`, "error");
+  else notify("proxy kill failed — the process may still be running; /headroom status to confirm", "error");
+}
+
+// F017: the restart branch, extracted. Carries the locked Slice-7 F004 reload + F030
+// re-sync verbatim, plus F045's reason on the unavailable notify.
+async function restartHandler(
+  pi: ExtensionAPI,
+  config: HeadroomConfig,
+  state: HeadroomState,
+  notify: (msg: string, level?: "info" | "warning" | "error") => void,
+): Promise<void> {
+  notify("restarting proxy...");
+  // F004: re-read headroom.json here. The factory's config snapshot is frozen at load
+  // (index.ts:1011), so the old code respawned with stale limits after an edit and the
+  // status WARNING plus README both half-admitted it in self-contradictory prose.
+  // Scope of the reload (D3): the fresh config reaches the proxy AND the provider wiring
+  // below. It does NOT reach the retrieve tool (index.ts:1060) or /headroom status
+  // (index.ts:907, :939, :961), which keep the factory's frozen port - so after a port edit
+  // this command names the new port while status still prints "proxy: running ... port
+  // <old>" (its liveness comes from the in-memory child handle, index.ts:445, not the
+  // port) and its probes plus headroom_retrieve dial the old port and fail. A full pi
+  // restart remains the only complete re-read; that is the documented tradeoff, not a
+  // defect.
+  const fresh = loadConfig();
+  const result = await restartProxy(fresh, state);
+  if (result === "unavailable") {
+    // F045: name the reason instead of the generic line.
+    const reason = spawnErrorReason(state.lastSpawnError);
+    notify(`proxy failed to come back healthy${reason ? ` (${reason})` : ""} — /headroom status for detail`, "error");
+    return;
+  }
+  // F030 across restarts: the fresh config may enable or disable providers, so re-diff
+  // the wiring instead of reporting the previous round's count. The shim is per-session
+  // and untouched by restartProxy, so its liveness is the shimOk input.
+  syncOverrides(pi, fresh, state, isShimAlive(state));
+  const label =
+    result === "adopted"
+      ? "re-adopted external instance"
+      : result === "already-running"
+        ? "already running"
+        : "restarted";
+  notify(`proxy ${label} on 127.0.0.1:${proxyPort(fresh)}; ${state.registered.length} providers wired`);
+}
+
 async function handleHeadroomCommand(
   pi: ExtensionAPI,
   args: string,
@@ -1305,132 +1554,17 @@ async function handleHeadroomCommand(
   const parts = (args ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
   const sub = parts[0] ?? "status";
 
+  // F017: the 108-line handler is now a router; each branch lives in its own function.
   if (sub === "status") {
-    const lines: string[] = [];
-    if (state.adopted) {
-      lines.push(`proxy: external instance on 127.0.0.1:${proxyPort(config)} (not spawned by pi; /headroom stop WILL kill it via the port-owner PID)`);
-    } else if (isAlive(state)) {
-      lines.push(`proxy: running (pid ${state.child?.pid}, port ${proxyPort(config)})`);
-    } else {
-      lines.push("proxy: DOWN — wired providers will error until /headroom restart");
-    }
-    if (state.version) {
-      const gate = versionAtLeast(state.version, MIN_VERSION);
-      lines.push(`version: ${state.version}${gate === false ? ` (below ${MIN_VERSION.join(".")}: chat-completions header support uncertain)` : ""}`);
-    } else {
-      lines.push("version: unknown");
-    }
-    const { enabled } = resolveProviders(config);
-    const shimIds = enabled.filter((p) => p.viaShim).map((p) => p.id);
-    if (shimIds.length > 0) {
-      if (isShimAlive(state)) {
-        lines.push(`shim: 127.0.0.1:${state.shimPort ?? shimPort(config)} (rewrites /v1/* to native paths) — ${shimIds.join(", ")}`);
-      } else {
-        lines.push(`shim: DOWN — ${shimIds.join(", ")} cannot route; /headroom restart or fix port ${shimPort(config)}`);
-      }
-    }
-    lines.push(`wired (${state.registered.length}): ${state.registered.length > 0 ? state.registered.join(", ") : "none"}`);
-    const { skipped } = resolveProviders(config);
-    if (skipped.length > 0) {
-      // F013: DEFAULT_DISABLED carries a reason per id, but only key membership was
-      // ever read, so the reasons were dead data and status printed bare ids. Show
-      // them; a config-disabled provider (not in DEFAULT_DISABLED) says so.
-      const withReasons = skipped.map((id) => {
-        const reason = DEFAULT_DISABLED[id];
-        return reason ? `${id} (${reason})` : `${id} (disabled in headroom.json)`;
-      });
-      lines.push(`not wired (disabled): ${withReasons.join(", ")}`);
-    }
-    const want = rateLimitEnv(config);
-    const ml = modelLimitsEnv(config);
-    if (ml.HEADROOM_MODEL_LIMITS) {
-      try {
-        const n = Object.keys(JSON.parse(ml.HEADROOM_MODEL_LIMITS).context_limits as Record<string, number>).length;
-        lines.push(`model limits: ${n} models from models.json (headroom default is 128,000)`);
-      } catch {
-        // unreachable: modelLimitsEnv only emits valid JSON
-      }
-    }
-    const stats = await fetchHealth(proxyOrigin(config), 2000, "/stats");
-    if (stats.healthy && stats.body) {
-      try {
-        const rl = (JSON.parse(stats.body) as {
-          rate_limiter?: { requests_per_minute?: number; tokens_per_minute?: number };
-        }).rate_limiter;
-        const tpm = rl?.tokens_per_minute;
-        if (typeof tpm === "number") {
-          lines.push(`rate limit: ${rl?.requests_per_minute} rpm / ${tpm} tpm (below these headroom 429s on its own)`);
-          const wantTpm = want.HEADROOM_TPM ? Number(want.HEADROOM_TPM) : null;
-          if (wantTpm && tpm < wantTpm) {
-            lines.push(
-              `WARNING: live proxy tpm=${tpm} < configured ${wantTpm}, so this proxy predates the config. ` +
-                "Fix: /headroom restart — it now kills any running instance (including adopted ones) " +
-                "and respawns with the current config (headroom.json is read once at load, so edit it first).",
-            );
-          }
-        }
-      } catch {
-        // /stats not JSON -> skip the rate-limit line
-      }
-    }
-    const { healthy, body } = await fetchHealth(proxyOrigin(config), 2000);
-    if (healthy && body) {
-      try {
-        const stats = JSON.parse(body) as { stats?: { total_requests?: number; tokens_saved?: number } };
-        if (stats.stats) {
-          lines.push(`stats: ${stats.stats.total_requests ?? 0} requests, ${stats.stats.tokens_saved ?? 0} tokens saved`);
-        }
-      } catch {
-        // body not JSON — skip the stats line
-      }
-    }
-    notify(lines.join("\n"));
+    notify(await renderStatus(config, state));
     return;
   }
-
   if (sub === "stop") {
-    const result = await stopProxy(config, state);
-    if (result === "stopped")
-      notify("proxy stopped (pi-spawned instance); providers still wired — turns will error until /headroom restart");
-    else if (result === "stopped-external")
-      notify("proxy stopped (external instance killed via port-owner PID); providers still wired — turns will error until /headroom restart");
-    else if (result === "not-running") notify("proxy not running", "warning");
-    else if (result === "lookup-failed")
-      notify(`proxy not stopped — the port-owner lookup failed on port ${proxyPort(config)} (is Get-NetTCPConnection/lsof available?)`, "error");
-    else notify("proxy kill failed — the process may still be running; /headroom status to confirm", "error");
+    await stopHandler(config, state, notify);
     return;
   }
-
   if (sub === "restart") {
-    notify("restarting proxy...");
-    // F004: re-read headroom.json here. The factory's config snapshot is frozen at load
-    // (index.ts:1011), so the old code respawned with stale limits after an edit and the
-    // status WARNING plus README both half-admitted it in self-contradictory prose.
-    // Scope of the reload (D3): the fresh config reaches the proxy AND the provider wiring
-    // below. It does NOT reach the retrieve tool (index.ts:1060) or /headroom status
-    // (index.ts:907, :939, :961), which keep the factory's frozen port - so after a port edit
-    // this command names the new port while status still prints "proxy: running ... port
-    // <old>" (its liveness comes from the in-memory child handle, index.ts:445, not the
-    // port) and its probes plus headroom_retrieve dial the old port and fail. A full pi
-    // restart remains the only complete re-read; that is the documented tradeoff, not a
-    // defect.
-    const fresh = loadConfig();
-    const result = await restartProxy(fresh, state);
-    if (result === "unavailable") {
-      notify("proxy failed to come back healthy — /headroom status for detail", "error");
-      return;
-    }
-    // F030 across restarts: the fresh config may enable or disable providers, so re-diff
-    // the wiring instead of reporting the previous round's count. The shim is per-session
-    // and untouched by restartProxy, so its liveness is the shimOk input.
-    syncOverrides(pi, fresh, state, isShimAlive(state));
-    const label =
-      result === "adopted"
-        ? "re-adopted external instance"
-        : result === "already-running"
-          ? "already running"
-          : "restarted";
-    notify(`proxy ${label} on 127.0.0.1:${proxyPort(fresh)}; ${state.registered.length} providers wired`);
+    await restartHandler(pi, config, state, notify);
     return;
   }
 
