@@ -88,7 +88,6 @@ export const DEFAULT_CONFIG = {
 } as const;
 
 export const DEFAULT_RATE_LIMIT = { rpm: 600, tpm: 10_000_000 } as const;
-export const DEFAULT_UPSTREAM_ARG = "hyper";
 export const MIN_VERSION = [0, 38, 0] as const;
 
 const endsWithV1 = (upstream: string): boolean => /\/v1\/?$/.test(upstream);
@@ -531,24 +530,43 @@ export function resolvePython(): string {
   return process.platform === "win32" ? "python" : "python3";
 }
 
-export async function headroomVersion(config: HeadroomConfig): Promise<string | null> {
+// F038: headroomVersion and findPortOwnerPid were the same spawn-capture-parse shape
+// twice - the second even carried a comment saying it was modeled on the first. One
+// probe, two callers. `shell` stays per-call because the two probes deliberately differ:
+// headroomVersion needs shell:true on win32 (F-V02 - a missing command must exit
+// non-zero instead of raising ENOENT, which is what makes it the CLI-absent signal),
+// while the port-owner probes are real executables on PATH and a cmd.exe wrapper would
+// put a shell PID between the lookup and the listener. windowsHide is a win32-only
+// option (ignored on POSIX), so it is unconditional here.
+async function spawnProbe(
+  command: string,
+  args: string[],
+  opts: { shell?: boolean } = {},
+): Promise<{ out: string; code: number | null; failed: boolean }> {
   return new Promise((resolve) => {
-    let out = "";
-    const child = spawn(config.command ?? DEFAULT_CONFIG.command, ["--version"], {
-      shell: process.platform === "win32",
+    const child = spawn(command, args, {
+      shell: opts.shell ?? false,
       stdio: ["ignore", "pipe", "ignore"],
       windowsHide: true,
     });
+    let out = "";
     child.stdout?.on("data", (chunk: Buffer) => {
       out += chunk.toString();
     });
-    child.on("error", () => resolve(null));
-    child.on("close", (code) => {
-      if (code !== 0) return resolve(null);
-      const match = out.match(/(\d+\.\d+\.\d+)/);
-      resolve(match ? match[1] : out.trim() || null);
-    });
+    // A spawn failure (ENOENT under no-shell) resolves failed - each caller maps it to
+    // its own sentinel (null / "lookup-failed").
+    child.on("error", () => resolve({ out, code: null, failed: true }));
+    child.on("close", (code) => resolve({ out, code, failed: false }));
   });
+}
+
+export async function headroomVersion(config: HeadroomConfig): Promise<string | null> {
+  const { out, code, failed } = await spawnProbe(config.command ?? DEFAULT_CONFIG.command, ["--version"], {
+    shell: process.platform === "win32",
+  });
+  if (failed || code !== 0) return null;
+  const match = out.match(/(\d+\.\d+\.\d+)/);
+  return match ? match[1] : out.trim() || null;
 }
 
 // F033: null is a real outcome — "cannot confirm" (absent or unparseable version) —
@@ -700,43 +718,31 @@ export function spawnProxy(
 // Outcomes are distinct on purpose: null means "no listener on the port" (an observable,
 // healthy state); "lookup-failed" means the lookup tool itself could not run. The two
 // must never conflate, or stop would report "not running" over a live proxy.
-// Modeled on headroomVersion's spawn-probe shape (spawn, capture stdout, resolve on
-// failure). No shell:true — both probes are real executables on PATH, and a direct spawn
-// keeps a cmd.exe wrapper out of the picture.
+// Shares spawnProbe with headroomVersion (F038). No shell for the port-owner probes —
+// they are real executables on PATH, and a direct spawn keeps a cmd.exe wrapper out of
+// the picture (headroomVersion keeps its win32 shell: F-V02).
 export async function findPortOwnerPid(
   config: HeadroomConfig,
 ): Promise<number | null | "lookup-failed"> {
   const port = proxyPort(config);
   const win32 = process.platform === "win32";
-  return new Promise((resolve) => {
-    const child = win32
-      ? spawn(
-          "powershell",
-          [
-            "-NoProfile",
-            "-Command",
-            `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ` +
-              "Select-Object -First 1 -ExpandProperty OwningProcess",
-          ],
-          { stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
-        )
-      : spawn("lsof", ["-ti", `tcp:${port}`, "-sTCP:LISTEN"], {
-          stdio: ["ignore", "pipe", "ignore"],
-        });
-    let out = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
-      out += chunk.toString();
-    });
-    child.on("error", () => resolve("lookup-failed"));
-    child.on("close", (code) => {
-      const pid = Number.parseInt(out.trim(), 10);
-      if (Number.isInteger(pid) && pid > 0) return resolve(pid);
-      // Windows: -ErrorAction SilentlyContinue makes a no-match exit 0 with empty stdout.
-      // POSIX: lsof exits 1 when nothing is found. Both mean "no listener", not failure.
-      if (code === 0 || (!win32 && code === 1)) return resolve(null);
-      resolve("lookup-failed");
-    });
-  });
+  const command = win32 ? "powershell" : "lsof";
+  const args = win32
+    ? [
+        "-NoProfile",
+        "-Command",
+        `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ` +
+          "Select-Object -First 1 -ExpandProperty OwningProcess",
+      ]
+    : ["-ti", `tcp:${port}`, "-sTCP:LISTEN"];
+  const { out, code, failed } = await spawnProbe(command, args);
+  if (failed) return "lookup-failed";
+  const pid = Number.parseInt(out.trim(), 10);
+  if (Number.isInteger(pid) && pid > 0) return pid;
+  // Windows: -ErrorAction SilentlyContinue makes a no-match exit 0 with empty stdout.
+  // POSIX: lsof exits 1 when nothing is found. Both mean "no listener", not failure.
+  if (code === 0 || (!win32 && code === 1)) return null;
+  return "lookup-failed";
 }
 
 // Awaited, outcome-checked kill — the first in this file (the old stopProxy discarded the
@@ -839,7 +845,7 @@ export async function stopProxy(
 // Poll until the port stops answering. Requires N consecutive failed probes before
 // declaring the port free: a taskkill'd external process can keep answering /health
 // while it dies, and a single early-exit probe plus ensureProxyRunning's 1500ms adopt
-// probe (index.ts:470) would re-adopt the corpse (state.adopted = true over a dying
+// probe would re-adopt the corpse (state.adopted = true over a dying
 // process). Two failures is ~2.2s of observed silence at the 200ms poll / 1s probe
 // timeout; the 5s deadline is unchanged. Timeout still returns void as before — the
 // caller's next ensureProxyRunning probe is the real arbiter.
@@ -1254,7 +1260,7 @@ export async function onSessionStart(
   if (envWarning) warn("[headroom] " + envWarning);
 
   // FR5: activate headroom_retrieve directly in every session. Extension tools start
-  // inactive (agent-session.js:2890-2892 activates only read/bash/edit/write), so the
+  // inactive (pi 1.0.1: agent-session.js's initial active tool set covers only read/bash/edit/write), so the
   // tool was reachable only via tool_search or codemode nesting — and a codemode-nested
   // result is named "codemode", which the proxy's name-keyed CCR exemption misses.
   // session_start re-fires on /new and /resume, so activation re-applies however the
@@ -1340,7 +1346,7 @@ export async function onSessionStart(
 }
 
 // FR3: the proxy is a machine-level singleton — session_shutdown fires on /new, /resume,
-// AND process exit (prior FRD evidence: dist/core/agent-session.js:2606, CHANGELOG.md:2089),
+// AND process exit (prior FRD evidence, verified against pi 1.0.1: agent-session.js emits session_shutdown; CHANGELOG.md:2089),
 // so killing here churned the proxy on every session change. Only /headroom stop ends it
 // now. The shim stays per-session by design (its port ladder and closeAllConnections
 // teardown are what make back-to-back /new rebinds work), and adopted/version bookkeeping
@@ -1449,7 +1455,7 @@ export async function renderStatus(config: HeadroomConfig, state: HeadroomState)
           lines.push(
             `WARNING: live proxy tpm=${tpm} < configured ${wantTpm}, so this proxy predates the config. ` +
               "Fix: /headroom restart — it now kills any running instance (including adopted ones) " +
-              "and respawns with the current config (headroom.json is read once at load, so edit it first).",
+              "and respawns with the current config.",
           );
         }
       }
@@ -1574,7 +1580,7 @@ async function handleHeadroomCommand(
 // Factory: config read at top, registrations only — ZERO side effects (proxy and shim
 // both start in the session_start hook, never here).
 //
-// pi re-runs the factory on session reload (agent-session.js reload() -> new extension
+// pi re-runs the factory on session reload (pi 1.0.1: agent-session.js reload() -> new extension
 // runner). The process-wide singleton keeps the shim/proxy handles across reloads, so a
 // reload round either finds the shim still listening or owns the rebinding — the old
 // server can never be orphaned holding the port.
@@ -1663,12 +1669,13 @@ export default function headroomExtension(pi: ExtensionAPI): void {
           ],
         };
       }
-      // F043: a 200 with an empty body resolves body = null (fetchHealth maps "" to null,
-      // index.ts:399). JSON.parse(null) coerces null to the string "null" and parses it to
-      // null WITHOUT throwing - the catch below never fires, and parsed.original_content
-      // throws an uncaught TypeError that kills pi. TS2345 (JSON.parse(string | null)) is
-      // the same site. This explicit branch narrows body to string for the try below - no
-      // cast - and answers a usable message instead of crashing the session.
+      // F043: a 200 with an empty body resolves body = null (httpGetStatus maps an empty
+      // body to null; fetchHealth is the thin 200-ness wrapper over it). JSON.parse(null)
+      // coerces null to the string "null" and parses it to null WITHOUT throwing - the
+      // catch below never fires, and parsed.original_content throws an uncaught
+      // TypeError that kills pi. TS2345 (JSON.parse(string | null)) is the same site.
+      // This explicit branch narrows body to string for the try below - no cast - and
+      // answers a usable message instead of crashing the session.
       if (body === null) {
         return {
           content: [
@@ -1686,7 +1693,8 @@ export default function headroomExtension(pi: ExtensionAPI): void {
       const original = parsed.original_content;
       // Byte-differentiation guard: the proxy's CompressionCache re-hashes this result next turn (raw-byte md5) and swaps it back to its <<ccr:...>> marker before the router's name exemption runs; one trailing newline breaks the hash.
       // Ceiling: if any layer trims trailing whitespace before hashing, byte-equality is restored and this fails silently.
-      // Contingency: HEADROOM_NO_CCR=1 — extension-spawned proxies only (adopted ones never see proxyEnv, index.ts:322/:427-429).
+      // Contingency: HEADROOM_NO_CCR=1 — extension-spawned proxies only (adopted ones
+      // never see the proxyEnv assembly; the flag is wired there behind config.noCcr).
       const text =
         (typeof original === "string" ? original : JSON.stringify(original ?? parsed, null, 2)) + "\n";
       return { content: [{ type: "text", text }] };

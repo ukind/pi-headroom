@@ -86,6 +86,7 @@ Upstreams come from `models.json`. This file carries only behavior:
 | `extraEnv` | — | Extra env vars for the spawned proxy (CA bundle, allow-lists) |
 | `rateLimit` | `{ rpm: 600, tpm: 10000000 }` | Headroom's own request/token bucket; `false` = its 60 rpm / 100k tpm defaults |
 | `modelLimits` | built from `models.json` | Context windows pushed into `HEADROOM_MODEL_LIMITS`; `false` = Headroom's 128k guess, or `{ "<model>": n }` to override |
+| `noCcr` | `false` | Set `HEADROOM_NO_CCR=1` on the spawned proxy, disabling CCR entirely — the escape hatch for the day some layer trims the trailing newline `headroom_retrieve` relies on (see Troubleshooting) |
 | `providers.<id>.enabled` | `true` | Route this provider through Headroom |
 | `providers.<id>.baseUrl` | from `models.json` | Upstream override |
 | `providers.<id>.shim` | auto | Force shim on/off; auto = shim when the chat path does not end in `/v1` |
@@ -107,7 +108,7 @@ Shim-routed providers need Headroom to accept a loopback target: the extension a
 
 - `/headroom status` — proxy state, version, shim state, wired/disabled lists
 - `/headroom stop` — stop the proxy, whichever process owns the port (pi-spawned via its child handle, adopted/external via a port-owner PID lookup); providers stay wired until restart
-- `/headroom restart` — kill any running instance + health-gated start
+- `/headroom restart` — kill any running instance + health-gated start. Re-reads `headroom.json` first, so limit and flag edits take effect on the spawned proxy and the provider wiring (a `port` edit is the exception — see Troubleshooting).
 
 ## Troubleshooting
 
@@ -115,10 +116,25 @@ Shim-routed providers need Headroom to accept a loopback target: the extension a
 - **`path shim unavailable ... (EADDRINUSE)`** — all of `8790`–`8795` are held (several long-lived pi sessions plus other software). Free one or set `"shimPort": 8796`.
 - **`HTTP_PROXY/HTTPS_PROXY ... NO_PROXY` warning at startup** — add `127.0.0.1,localhost` to `NO_PROXY`; pi's dispatcher has no loopback bypass.
 - **`certificate verify failed` in proxy logs** — TLS interception; do step 3. A bundle path that does not exist is dropped (a dead path breaks every upstream call), so the fix is to create the file, then restart pi — `/headroom status` shows whether it was picked up.
+- **Retrieved originals come back re-compressed (a `<<ccr:...>>` marker survives `headroom_retrieve`)** — some layer trimmed the trailing newline that keeps the retrieved bytes different from the compressed ones. Set `"noCcr": true` in `headroom.json` and run `/headroom restart`: the extension then spawns the proxy with `HEADROOM_NO_CCR=1`, which disables CCR entirely (no compression, no markers). This reaches only proxies pi spawns — an adopted proxy never sees the extension's environment, so set `HEADROOM_NO_CCR=1` in the shell you start it from.
 - **`the headroom CLI is missing or cannot run`** — install it with `uv tool install "headroom-ai[proxy]"`, then start pi from a NEW terminal: PATH changes never reach an already-open shell. The extension gives up in ~50 ms here instead of waiting out `healthTimeoutMs`.
 - **Every provider fails at once with `429 status code (no body)`** — that is Headroom's own limiter, not the providers'. Read `curl -s http://127.0.0.1:8787/stats` → `rate_limited_by_source` (`headroom` vs `upstream`) and `rate_limiter`. `/headroom status` prints the live limits.
-- **`/headroom status` prints `WARNING: live proxy tpm=... < configured ...`** — the proxy predates the config. `/headroom restart` fixes this: it now kills any running instance (including adopted ones) and respawns with the current config (`headroom.json` is read once at load, so edit it before restarting).
+- **`/headroom status` prints `WARNING: live proxy tpm=... < configured ...`** — the proxy predates the config. `/headroom restart` fixes this: it now kills any running instance (including adopted ones) and respawns with the current config.
+- **After a `port` edit in `headroom.json`, `/headroom restart` is not enough** — the restart re-reads the config for the proxy and the provider wiring, but `headroom_retrieve` and `/headroom status` keep the port captured when pi loaded the extension: the restart confirmation names the new port while status still prints the old one, and its probes plus retrievals dial the old port and fail. Limit and flag edits are unaffected (the port is the only config field that reaches a base URL). A full pi restart is the only complete re-read.
 - **Provider turns fail with 401** — Headroom relays your `Authorization` header to the upstream; check the key in `models.json` for that provider.
+
+## Testing
+
+Dev-only harness — `node_modules/` is gitignored, and nothing here runs at extension load:
+
+```
+npm install           # dev dependencies: typescript, @types/node, typebox (pinned 1.3.27)
+npm run check         # tsc --noEmit — the type gate (0 errors total)
+npm test              # node --test unit suite: pure helpers, DI seams, shim error paths
+npm run test:harness  # the two falsification deliverables, on generated free ports
+```
+
+`npm run test:harness` runs `test/test_retrieve_forms.py` (four byte-contract cases against the installed headroom package) and `test/driver_e2e.mjs` (live wire-level e2e: seeds the compression store, spawns a proxy on two generated ports, replays the aggregated retrieve form across two turns). The Python interpreter is resolved the way the extension resolves it — `HEADROOM_PYTHON`, then the uv tool layout, then a bare name on `PATH` — and the headroom package must be installed (`uv tool install "headroom-ai[proxy]"`).
 
 ## Rollback
 
@@ -126,5 +142,5 @@ Delete the folder. The extension persists nothing — no `models.json` or `setti
 
 ## Requirements
 
-- pi >= 0.87, Node >= 23.6 (native TypeScript stripping)
+- pi >= 1.0.1 (verified; the pi-internals citations in `index.ts` were checked against 1.0.1), Node >= 23.6 (native TypeScript stripping)
 - headroom-ai >= 0.38.0 (`uv tool install "headroom-ai[proxy]"`)
