@@ -929,7 +929,15 @@ async function handleHeadroomCommand(
   config: HeadroomConfig,
   state: HeadroomState,
 ): Promise<void> {
-  const notify = (msg: string, level: "info" | "warning" | "error" = "info") => ctx.ui.notify(msg, level);
+  // F047: mirror onSessionStart's warn guard (index.ts:800-803) — a headless dispatch
+  // (no dialog-capable UI) must fall back to the console instead of throwing a TypeError
+  // out of the command handler. Severity maps onto the matching console method.
+  const notify = (msg: string, level: "info" | "warning" | "error" = "info") => {
+    if (ctx?.hasUI) ctx.ui.notify(msg, level);
+    else if (level === "error") console.error(msg);
+    else if (level === "warning") console.warn(msg);
+    else console.log(msg);
+  };
   const parts = (args ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
   const sub = parts[0] ?? "status";
 
